@@ -5543,6 +5543,27 @@ static void glue(gen_, name)(DisasContext *ctx)                               \
                          rD(ctx->opcode), Rc(ctx->opcode));                   \
 }
 
+/*
+ * PPC405 FSL (Fast Simplex Link / FCM) instructions.
+ * opcode=31, opc2=0x09, opc3=0x10..0x1F  (XO = 0x130..0x13F).
+ *
+ * In this QEMU model there is no FPGA FCM fabric attached, so:
+ *   - "get" variants (read channels):  set rD = 0, simulating an empty channel.
+ *   - "put" variants (write channels): silently discard the value (NOP).
+ *
+ * Setting rD = 0 causes VxWorks FSL validity checks (fsl_isinvalid) to see the
+ * channel as empty/unavailable, which is the correct behaviour with no FPGA.
+ */
+static void gen_fsl_get(DisasContext *ctx)
+{
+    tcg_gen_movi_tl(cpu_gpr[rD(ctx->opcode)], 0);
+}
+
+static void gen_fsl_put(DisasContext *ctx)
+{
+    /* no FCM hardware: silently discard */
+}
+
 /* macchw    - macchw.    */
 GEN_MAC_HANDLER(macchw, 0x0C, 0x05);
 /* macchwo   - macchwo.   */
@@ -6937,6 +6958,29 @@ GEN_MAC_HANDLER(mulhhw, 0x08, 0x01),
 GEN_MAC_HANDLER(mulhhwu, 0x08, 0x00),
 GEN_MAC_HANDLER(mullhw, 0x08, 0x0D),
 GEN_MAC_HANDLER(mullhwu, 0x08, 0x0C),
+
+/*
+ * PPC405 FSL (Fast Simplex Link / FCM) instruction table entries.
+ * XO 0x130-0x13F: opc1=0x1F, opc2=0x09, opc3=0x10-0x1F.
+ * "get" variants read rD <- 0 (empty channel); "put" variants are NOPs.
+ * Registered under PPC_405_MAC so they are only active on PPC405 CPUs.
+ */
+GEN_HANDLER2(fsl_get,    "tget",   0x1F, 0x09, 0x10, 0x00000000, PPC_405_MAC),
+GEN_HANDLER2(fsl_put,    "tput",   0x1F, 0x09, 0x11, 0x00000000, PPC_405_MAC),
+GEN_HANDLER2(fsl_get,    "tnget",  0x1F, 0x09, 0x12, 0x00000000, PPC_405_MAC),
+GEN_HANDLER2(fsl_put,    "tnput",  0x1F, 0x09, 0x13, 0x00000000, PPC_405_MAC),
+GEN_HANDLER2(fsl_get,    "tcget",  0x1F, 0x09, 0x14, 0x00000000, PPC_405_MAC),
+GEN_HANDLER2(fsl_put,    "tcput",  0x1F, 0x09, 0x15, 0x00000000, PPC_405_MAC),
+GEN_HANDLER2(fsl_get,    "tncget", 0x1F, 0x09, 0x16, 0x00000000, PPC_405_MAC),
+GEN_HANDLER2(fsl_put,    "tncput", 0x1F, 0x09, 0x17, 0x00000000, PPC_405_MAC),
+GEN_HANDLER2(fsl_get,    "get",    0x1F, 0x09, 0x18, 0x00000000, PPC_405_MAC),
+GEN_HANDLER2(fsl_put,    "put",    0x1F, 0x09, 0x19, 0x00000000, PPC_405_MAC),
+GEN_HANDLER2(fsl_get,    "nget",   0x1F, 0x09, 0x1a, 0x00000000, PPC_405_MAC),
+GEN_HANDLER2(fsl_put,    "nput",   0x1F, 0x09, 0x1b, 0x00000000, PPC_405_MAC),
+GEN_HANDLER2(fsl_get,    "cget",   0x1F, 0x09, 0x1c, 0x00000000, PPC_405_MAC),
+GEN_HANDLER2(fsl_put,    "cput",   0x1F, 0x09, 0x1d, 0x00000000, PPC_405_MAC),
+GEN_HANDLER2(fsl_get,    "ncget",  0x1F, 0x09, 0x1e, 0x00000000, PPC_405_MAC),
+GEN_HANDLER2(fsl_put,    "ncput",  0x1F, 0x09, 0x1f, 0x00000000, PPC_405_MAC),
 
 GEN_HANDLER2_E(tbegin, "tbegin", 0x1F, 0x0E, 0x14, 0x01DFF800, \
                PPC_NONE, PPC2_TM),

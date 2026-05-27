@@ -1816,6 +1816,19 @@ static bool mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
         l->page[0].size = size0;
 
         /*
+         * For 32-bit guests, page[1].addr may have overflowed.
+         * Example: addr=0xFFFFFFFF, size=4 gives
+         *   page[1].addr = (0xFFFFFFFF + 3) & mask = 0x100000000
+         * which mmu_lookup1 uses as the TLB lookup key.  It happens
+         * to hit the TLB entry for page 0 (same index bits) and
+         * computes haddr = 0x100000000 + host_ram_base, a bogus
+         * host address that crashes QEMU.
+         * Truncating to target_ulong wraps 0x100000000 to 0x00000000.
+         * size0 must be computed before this truncation.
+         */
+        l->page[1].addr = (target_ulong)l->page[1].addr;
+
+        /*
          * Lookup both pages, recognizing exceptions from either.  If the
          * second lookup potentially resized, refresh first CPUTLBEntryFull.
          */

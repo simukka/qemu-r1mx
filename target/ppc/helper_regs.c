@@ -313,11 +313,10 @@ int hreg_store_msr(CPUPPCState *env, target_ulong value, int alter_hv)
 #ifndef CONFIG_USER_ONLY
 void store_40x_sler(CPUPPCState *env, uint32_t val)
 {
-    /* XXX: TO BE FIXED */
-    if (val != 0x00000000) {
-        cpu_abort(env_cpu(env),
-                  "Little-endian regions are not supported by now\n");
-    }
+    /* r1mx: firmware uses address 0x7c as a countdown counter during early boot,
+     * causing transient instruction bytes that QEMU decodes as mtspr SLER.
+     * PPC405 SLER controls little-endian memory regions; silently ignore non-zero
+     * writes since QEMU doesn't emulate LE regions and the firmware doesn't need them. */
     env->spr[SPR_405_SLER] = val;
 }
 

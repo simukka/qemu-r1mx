@@ -1380,7 +1380,14 @@ bool ppc_cpu_tlb_fill(CPUState *cs, vaddr eaddr, int size,
 
     if (ppc_xlate(cpu, eaddr, access_type, &raddr,
                   &page_size, &prot, mmu_idx, !probe)) {
-        tlb_set_page(cs, eaddr & TARGET_PAGE_MASK, raddr & TARGET_PAGE_MASK,
+        /*
+         * For 32-bit PPC, eaddr is a vaddr (uint64_t) but must be
+         * truncated to target_ulong (uint32_t) before masking.  Without
+         * the cast, TARGET_PAGE_MASK sign-extends from int32_t to 64-bit
+         * so 0x100000000 & mask = 0x100000000 instead of 0x00000000.
+         */
+        tlb_set_page(cs, (target_ulong)eaddr & TARGET_PAGE_MASK,
+                     raddr & TARGET_PAGE_MASK,
                      prot, mmu_idx, 1UL << page_size);
         return true;
     }
