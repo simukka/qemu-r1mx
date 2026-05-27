@@ -154,3 +154,6 @@ system_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa_ec.c'))
 
 # HPPA devices
 system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
+
+# PPC405 / Xilinx Virtex-4 (r1mx) devices
+system_ss.add(when: 'CONFIG_PPC405', if_true: files('red_histogram_ip.c'))

@@ -347,12 +347,34 @@ static void r1mx_init(MachineState *machine)
     /* RED custom error-counter IP (probed early in boot, patches #40-42) */
     create_unimplemented_device("red-errctrs", ERRCTRS_BASE, ERRCTRS_SIZE);
 
-    /* RED histogram IP cores (sensor pipeline, not needed for boot) */
-    create_unimplemented_device("red-hist0", HIST0_BASE, HIST_SIZE);
-    create_unimplemented_device("red-hist1", HIST1_BASE, HIST_SIZE);
-    create_unimplemented_device("red-hist2", HIST2_BASE, HIST_SIZE);
-    create_unimplemented_device("red-hist3", HIST3_BASE, HIST_SIZE);
-    create_unimplemented_device("red-hist4", HIST4_BASE, HIST_SIZE);
+    /* --- RED custom histogram/waveform IP cores (red.histogram-ip) ------
+     * Five proprietary FPGA IP blocks in the sensor pipeline.
+     * Firmware reads status registers during sysHwInit_seq but never
+     * busy-polls; returning 0 for all reads causes the firmware to skip
+     * the "histogram enabled" paths and continue boot cleanly.
+     * IRQ lines are never asserted (no sensor data in emulation).
+     *
+     * Names / PLB addresses (from firmware device strings + xparameters.h):
+     *   "Luma Histogram"  0xe0080000   "RGB Histogram"    0xe00a0000
+     *   "RGB Comp Histo"  0xe0100000   "Mono Histogram"   0xe0120000
+     *   "Luma Waveform"   0xe0200000
+     * Size: 0x20000 each (128 KB) to cover all observed access offsets. */
+    {
+        static const hwaddr hist_bases[] = {
+            HIST1_BASE,   /* Luma Histogram  0xe0080000 */
+            HIST0_BASE,   /* RGB Histogram   0xe00a0000 */
+            HIST2_BASE,   /* RGB Comp Histo  0xe0100000 */
+            HIST3_BASE,   /* Mono Histogram  0xe0120000 */
+            HIST4_BASE,   /* Luma Waveform   0xe0200000 */
+        };
+        unsigned i;
+        for (i = 0; i < ARRAY_SIZE(hist_bases); i++) {
+            DeviceState  *hd = qdev_new("red.histogram-ip");
+            SysBusDevice *hs = SYS_BUS_DEVICE(hd);
+            sysbus_realize_and_unref(hs, &error_fatal);
+            sysbus_mmio_map(hs, 0, hist_bases[i]);
+        }
+    }
 
     /* --- XPS PCI v1.02a host bridge (xlnx.opb-pci-host) -----------------
      * Confirmed base: 0xe1200000 (XPAR_PCI_0_BASEADDR / PCI_CFG_BASE).
