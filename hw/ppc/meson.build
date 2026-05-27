@@ -55,7 +55,8 @@ ppc_ss.add(when: 'CONFIG_POWERNV', if_true: files(
 # PowerPC 4xx boards
 ppc_ss.add(when: 'CONFIG_PPC405', if_true: files(
   'ppc405_boards.c',
-  'ppc405_uc.c'))
+  'ppc405_uc.c',
+  'r1mx_virtex4.c'))
 ppc_ss.add(when: 'CONFIG_PPC440', if_true: files(
   'ppc440_bamboo.c',
   'ppc440_pcix.c', 'ppc440_uc.c'))
