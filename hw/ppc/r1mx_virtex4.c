@@ -354,8 +354,18 @@ static void r1mx_init(MachineState *machine)
     create_unimplemented_device("red-hist3", HIST3_BASE, HIST_SIZE);
     create_unimplemented_device("red-hist4", HIST4_BASE, HIST_SIZE);
 
-    /* XPS PCI v3 (SiI3512 SATA + ISP1562 USB hang off here) */
-    create_unimplemented_device("xps-pci-cfg", PCI_CFG_BASE, PCI_CFG_SIZE);
+    /* --- XPS PCI v1.02a host bridge (xlnx.opb-pci-host) -----------------
+     * Confirmed base: 0xe1200000 (XPAR_PCI_0_BASEADDR / PCI_CFG_BASE).
+     * Exposes IPIF interrupt registers + CAR/CDR PCI config cycle port.
+     * Bus is empty (all config reads return 0xFFFFFFFF = no device).
+     * XPci_SelfTest() has no hardware access and always returns XST_SUCCESS.
+     * SiI3512 SATA and ISP1562 USB stubs deferred to later phases. */
+    {
+        DeviceState  *pci_dev = qdev_new("xlnx.opb-pci-host");
+        SysBusDevice *pci_sbd = SYS_BUS_DEVICE(pci_dev);
+        sysbus_realize_and_unref(pci_sbd, &error_fatal);
+        sysbus_mmio_map(pci_sbd, 0, PCI_CFG_BASE);
+    }
 
     /* XPS IIC (I²C) */
     create_unimplemented_device("xps-iic", I2C_BASE, I2C_SIZE);
