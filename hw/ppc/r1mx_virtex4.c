@@ -90,6 +90,42 @@
 #define IRQ_DMA         2
 
 /* ---------------------------------------------------------------------------
+ * NOR flash / boot ROM stub
+ *
+ * The RED ONE MX uses parallel NOR flash at 0xf0000000 (128 MB) accessed via
+ * the PPC405 External Bus Controller (EBC).  A 64 KB boot ROM alias appears at
+ * 0xffff0000.  The firmware is loaded directly into DRAM in our emulation so
+ * we never execute from flash, but VxWorks TFFS (True Flash File System) probes
+ * this region during usrRoot() and expects the erased-flash all-ones pattern
+ * (0xFF) rather than zeros.  Returning 0x00 causes CFI detection to mis-fire and
+ * TFFS to log "flash geometry mismatch" errors that can stall boot.
+ *
+ * This stub returns 0xFF for all reads and silently discards writes (no
+ * persistent backing store — flash programming has no effect in emulation).
+ * --------------------------------------------------------------------------- */
+static uint64_t nor_flash_read(void *opaque, hwaddr offset, unsigned size)
+{
+    /* Erased NOR flash: all bits high */
+    return 0xFFFFFFFFFFFFFFFFULL >> (64 - size * 8);
+}
+
+static void nor_flash_write(void *opaque, hwaddr offset,
+                            uint64_t val, unsigned size)
+{
+    /* Discard: no persistent flash backing in emulation */
+}
+
+static const MemoryRegionOps nor_flash_ops = {
+    .read       = nor_flash_read,
+    .write      = nor_flash_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
+/* ---------------------------------------------------------------------------
  * FPGA fabric TCP bridge (port 17186)
  *
  * Every write to an FPGA peripheral (0xe0000000-0xe3ffffff) is forwarded to
@@ -396,9 +432,23 @@ static void r1mx_init(MachineState *machine)
     create_unimplemented_device("pci-mem0",  PCI_MEM_BASE,  PCI_MEM_SIZE);
     create_unimplemented_device("pci-mem1",  PCI_MEM2_BASE, PCI_MEM2_SIZE);
 
-    /* NOR flash and boot ROM (we load firmware directly; no real flash model) */
-    create_unimplemented_device("nor-flash",  NOR_FLASH_BASE, NOR_FLASH_SIZE);
-    create_unimplemented_device("boot-rom",   BOOT_ROM_BASE,  BOOT_ROM_SIZE);
+    /* --- NOR flash (128 MB at 0xf0000000) and boot ROM (64 KB at 0xffff0000)
+     * Both return 0xFF on reads (erased NOR flash state) and discard writes.
+     * VxWorks TFFS CFI probe expects 0xFF from blank flash; returning 0x00
+     * causes geometry-detection errors.  No persistent backing — flash writes
+     * have no effect in emulation. */
+    {
+        MemoryRegion *nor = g_new(MemoryRegion, 1);
+        memory_region_init_io(nor, NULL, &nor_flash_ops, NULL,
+                              "nor-flash", NOR_FLASH_SIZE);
+        memory_region_add_subregion(sysmem, NOR_FLASH_BASE, nor);
+    }
+    {
+        MemoryRegion *rom = g_new(MemoryRegion, 1);
+        memory_region_init_io(rom, NULL, &nor_flash_ops, NULL,
+                              "boot-rom", BOOT_ROM_SIZE);
+        memory_region_add_subregion(sysmem, BOOT_ROM_BASE, rom);
+    }
 
     /* --- FPGA fabric catch-all (64 MB at 0xe0000000-0xe3ffffff) ----------
      * Silently absorbs reads/writes to FPGA peripherals not individually
