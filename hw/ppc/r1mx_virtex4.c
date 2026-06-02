@@ -22,6 +22,28 @@
  *   Xilinx DS599  — XPS EthernetLite IP core
  *   Xilinx DS572  — XPS Interrupt Controller IP core
  *   firmware/reverse/build_32/re_reference.md §6 (PLB table), §7 (DCR map)
+ *
+ * Device activity monitor
+ *   An activity broker listens on TCP localhost:17187 and broadcasts 32-byte
+ *   "RDEV" packets for every MMIO read/write on the following devices:
+ *     UARTLite, EthernetLite (via interposing MemoryRegion spy)
+ *     OPB DMA, Histogram IPs (via per-device callback)
+ *     FPGA catch-all (every unmodelled FPGA peripheral access)
+ *
+ *   Packet layout (32 bytes, all multi-byte fields big-endian):
+ *     [0-3]   magic "RDEV"
+ *     [4]     device_id  (R1MX_DEV_* from r1mx_activity.h)
+ *     [5]     direction  'R'=0x52 / 'W'=0x57
+ *     [6]     access size in bytes (1, 2, or 4)
+ *     [7]     reserved 0
+ *     [8-11]  guest physical address (uint32 big-endian)
+ *     [12-15] value (uint32 big-endian, lower 32 bits of 64-bit val)
+ *     [16-23] virtual-clock timestamp in nanoseconds (uint64 big-endian)
+ *     [24-31] reserved 0
+ *
+ *   To start the GUI monitor:
+ *     python3 -m toolkit.gui.emulator
+ *   (from the r1mx toolkit directory, or run toolkit/gui/emulator.py directly)
  */
 
 #include "qemu/osdep.h"
@@ -40,8 +62,11 @@
 #include "sysemu/reset.h"
 #include "net/net.h"
 #include "qemu/main-loop.h"
+#include "qemu/timer.h"
+#include "hw/ppc/r1mx_activity.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <fcntl.h>
 
 /* ---------------------------------------------------------------------------
@@ -225,17 +250,214 @@ static void lcd_bridge_send(R1mxLcdBridge *br,
 }
 
 /* ---------------------------------------------------------------------------
+ * Activity broker (port 17187)
+ *
+ * Broadcasts 32-byte "RDEV" packets for every MMIO access on any hooked
+ * device.  At most one GUI client is accepted at a time; a new connection
+ * drops the previous one.  All errors are non-fatal.
+ * --------------------------------------------------------------------------- */
+#define ACTIVITY_TCP_PORT  17187
+
+typedef struct R1mxActivityBroker {
+    int listen_fd;   /* server socket (O_NONBLOCK), -1 if unavailable */
+    int client_fd;   /* accepted client, -1 if disconnected           */
+} R1mxActivityBroker;
+
+static R1mxActivityBroker g_activity_broker = { .listen_fd = -1,
+                                                 .client_fd = -1 };
+
+static void activity_broker_accept(void *opaque)
+{
+    R1mxActivityBroker *br = opaque;
+    int fd = accept(br->listen_fd, NULL, NULL);
+    if (fd < 0) {
+        return;
+    }
+    if (br->client_fd >= 0) {
+        close(br->client_fd);
+    }
+    br->client_fd = fd;
+    {
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    }
+}
+
+static void activity_broker_init(R1mxActivityBroker *br)
+{
+    struct sockaddr_in addr;
+    int fd, one = 1;
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return;
+    }
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port        = htons(ACTIVITY_TCP_PORT);
+
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
+        listen(fd, 1) < 0) {
+        close(fd);
+        return;
+    }
+
+    br->listen_fd = fd;
+    qemu_set_fd_handler(fd, activity_broker_accept, NULL, br);
+}
+
+/*
+ * activity_broker_send — emit one 32-byte RDEV packet.
+ *
+ * This is the low-level sender; most callers go via the R1mxActivityCb
+ * trampoline installed on each device or via the spy region ops below.
+ */
+static void activity_broker_send(R1mxActivityBroker *br,
+                                  uint8_t dev_id, uint8_t dir,
+                                  uint32_t addr, uint64_t val, unsigned size)
+{
+    uint8_t  pkt[32];
+    uint64_t ts;
+
+    if (br->client_fd < 0) {
+        return;
+    }
+
+    ts = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    pkt[0] = 'R'; pkt[1] = 'D'; pkt[2] = 'E'; pkt[3] = 'V';
+    pkt[4]  = dev_id;
+    pkt[5]  = dir;
+    pkt[6]  = (uint8_t)size;
+    pkt[7]  = 0;
+    pkt[8]  = (addr >> 24) & 0xff;
+    pkt[9]  = (addr >> 16) & 0xff;
+    pkt[10] = (addr >>  8) & 0xff;
+    pkt[11] =  addr        & 0xff;
+    pkt[12] = (val  >> 24) & 0xff;
+    pkt[13] = (val  >> 16) & 0xff;
+    pkt[14] = (val  >>  8) & 0xff;
+    pkt[15] =  val         & 0xff;
+    pkt[16] = (ts   >> 56) & 0xff;
+    pkt[17] = (ts   >> 48) & 0xff;
+    pkt[18] = (ts   >> 40) & 0xff;
+    pkt[19] = (ts   >> 32) & 0xff;
+    pkt[20] = (ts   >> 24) & 0xff;
+    pkt[21] = (ts   >> 16) & 0xff;
+    pkt[22] = (ts   >>  8) & 0xff;
+    pkt[23] =  ts          & 0xff;
+    memset(pkt + 24, 0, 8);
+
+    if (send(br->client_fd, pkt, sizeof(pkt), MSG_NOSIGNAL) < 0) {
+        close(br->client_fd);
+        br->client_fd = -1;
+    }
+}
+
+/*
+ * R1mxActivityCb trampoline — installed on per-device callback fields.
+ * opaque points to g_activity_broker.
+ */
+static void activity_broker_cb(uint8_t dev_id, uint8_t dir,
+                                uint32_t addr, uint64_t val, unsigned size,
+                                void *opaque)
+{
+    activity_broker_send((R1mxActivityBroker *)opaque,
+                          dev_id, dir, addr, val, size);
+}
+
+/* ---------------------------------------------------------------------------
+ * Spy MemoryRegion — transparent interposing region
+ *
+ * Mapped at higher priority (1) over the real device's region.  Every read
+ * and write is logged to the activity broker and then forwarded directly to
+ * the underlying device's MMIO ops, bypassing the address-space layer so
+ * there is no infinite interposition loop.
+ *
+ * Endianness: the spy uses DEVICE_BIG_ENDIAN (same as all R1MX devices).
+ * The real device's ops->read/write are called with the same (offset, size)
+ * that the spy received, so the endianness contract is identical.
+ *
+ * NOTE: this technique requires that the real device uses flat MMIO ops
+ * (not a container MemoryRegion).  Both XPS UARTLite and XPS EthernetLite
+ * satisfy this requirement.
+ * --------------------------------------------------------------------------- */
+typedef struct R1mxSpyRegion {
+    MemoryRegion  mr;
+    MemoryRegion *real_mr;   /* the real device's MMIO region */
+    uint8_t       dev_id;
+    uint32_t      base;      /* guest physical base address   */
+} R1mxSpyRegion;
+
+static uint64_t spy_read(void *opaque, hwaddr offset, unsigned size)
+{
+    R1mxSpyRegion *spy = opaque;
+    uint64_t val = 0;
+
+    if (spy->real_mr->ops && spy->real_mr->ops->read) {
+        val = spy->real_mr->ops->read(spy->real_mr->opaque, offset, size);
+    }
+    activity_broker_send(&g_activity_broker, spy->dev_id, R1MX_DIR_READ,
+                          spy->base + (uint32_t)offset, val, size);
+    return val;
+}
+
+static void spy_write(void *opaque, hwaddr offset,
+                       uint64_t val, unsigned size)
+{
+    R1mxSpyRegion *spy = opaque;
+
+    activity_broker_send(&g_activity_broker, spy->dev_id, R1MX_DIR_WRITE,
+                          spy->base + (uint32_t)offset, val, size);
+    if (spy->real_mr->ops && spy->real_mr->ops->write) {
+        spy->real_mr->ops->write(spy->real_mr->opaque, offset, val, size);
+    }
+}
+
+static const MemoryRegionOps spy_ops = {
+    .read       = spy_read,
+    .write      = spy_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
+/* Allocate and install a spy region over [base, base+size). */
+static void install_spy(MemoryRegion *sysmem, SysBusDevice *sbd,
+                         unsigned mmio_idx, hwaddr base, uint64_t spy_size,
+                         uint8_t dev_id)
+{
+    R1mxSpyRegion *spy = g_new0(R1mxSpyRegion, 1);
+    spy->real_mr = sysbus_mmio_get_region(sbd, mmio_idx);
+    spy->dev_id  = dev_id;
+    spy->base    = (uint32_t)base;
+    memory_region_init_io(&spy->mr, NULL, &spy_ops, spy,
+                           "r1mx.spy", spy_size);
+    /* priority 1 > default 0: spy wins over the real device region */
+    memory_region_add_subregion_overlap(sysmem, base, &spy->mr, 1);
+}
+
+/* ---------------------------------------------------------------------------
  * FPGA fabric catch-all MMIO region (0xe0000000 - 0xe3ffffff, 64 MB)
  *
  * Absorbs accesses to FPGA peripherals not yet individually modelled so that
  * the firmware does not trigger Machine Check Exceptions on those addresses.
- * Reads return 0; writes are forwarded to the LCD TCP bridge.
+ * Reads return 0 (and are reported); writes are forwarded to both the LCD TCP
+ * bridge and the activity broker.
  * Priority -2000 keeps this region BELOW all named devices mapped in the same
  * address range (XIntc at 0xe0800000, XUartLite at 0xe0600000, etc.).
  * --------------------------------------------------------------------------- */
 static uint64_t fpga_catchall_read(void *opaque, hwaddr offset, unsigned size)
 {
-    (void)opaque; (void)offset; (void)size;
+    (void)opaque;
+    activity_broker_send(&g_activity_broker, R1MX_DEV_FPGA, R1MX_DIR_READ,
+                          (uint32_t)(0xe0000000u + offset), 0, size);
     return 0;
 }
 
@@ -244,6 +466,8 @@ static void fpga_catchall_write(void *opaque, hwaddr offset,
 {
     R1mxLcdBridge *br = opaque;
     lcd_bridge_send(br, (uint32_t)(0xe0000000u + offset), val, size);
+    activity_broker_send(&g_activity_broker, R1MX_DEV_FPGA, R1MX_DIR_WRITE,
+                          (uint32_t)(0xe0000000u + offset), val, size);
 }
 
 static const MemoryRegionOps fpga_catchall_ops = {
@@ -342,6 +566,9 @@ static void r1mx_init(MachineState *machine)
         sysbus_realize_and_unref(uart_sbd, &error_fatal);
         sysbus_mmio_map(uart_sbd, 0, UARTLITE_BASE);
         sysbus_connect_irq(uart_sbd, 0, intc_irqs[IRQ_UARTLITE]);
+        /* Spy region intercepts all UARTLite accesses for the activity monitor.
+         * UARTLite register space is 16 bytes (4 regs × 4 bytes). */
+        install_spy(sysmem, uart_sbd, 0, UARTLITE_BASE, 0x10, R1MX_DEV_UART);
     }
 
     /* --- XPS EthernetLite (WDB UDP 17185) -------------------------------- */
@@ -356,6 +583,9 @@ static void r1mx_init(MachineState *machine)
         sysbus_realize_and_unref(eth_sbd, &error_fatal);
         sysbus_mmio_map(eth_sbd, 0, ETHLITE_BASE);
         sysbus_connect_irq(eth_sbd, 0, intc_irqs[IRQ_ETHLITE]);
+        /* Spy region covers the full dual-buffer ping-pong address space
+         * (Xilinx DS599: 0x20000 bytes for 2×TX + 2×RX + control regs). */
+        install_spy(sysmem, eth_sbd, 0, ETHLITE_BASE, 0x20000, R1MX_DEV_ETHERNET);
     }
 
     /* --- Unimplemented / stub regions ------------------------------------ */
@@ -378,6 +608,9 @@ static void r1mx_init(MachineState *machine)
         sysbus_realize_and_unref(dma_sbd, &error_fatal);
         sysbus_mmio_map(dma_sbd, 0, DMA_BASE);
         sysbus_connect_irq(dma_sbd, 0, intc_irqs[IRQ_DMA]);
+        xlnx_opb_dma_set_activity(dma_dev, R1MX_DEV_DMA,
+                                   activity_broker_cb, &g_activity_broker);
+        xlnx_opb_dma_set_base(dma_dev, DMA_BASE);
     }
 
     /* RED custom error-counter IP (probed early in boot, patches #40-42) */
@@ -403,12 +636,23 @@ static void r1mx_init(MachineState *machine)
             HIST3_BASE,   /* Mono Histogram  0xe0120000 */
             HIST4_BASE,   /* Luma Waveform   0xe0200000 */
         };
+        static const uint8_t hist_dev_ids[] = {
+            R1MX_DEV_HIST_LUMA,
+            R1MX_DEV_HIST_RGB,
+            R1MX_DEV_HIST_RGBC,
+            R1MX_DEV_HIST_MONO,
+            R1MX_DEV_HIST_WAVE,
+        };
         unsigned i;
         for (i = 0; i < ARRAY_SIZE(hist_bases); i++) {
             DeviceState  *hd = qdev_new("red.histogram-ip");
             SysBusDevice *hs = SYS_BUS_DEVICE(hd);
             sysbus_realize_and_unref(hs, &error_fatal);
             sysbus_mmio_map(hs, 0, hist_bases[i]);
+            red_histogram_ip_set_activity(hd, hist_dev_ids[i],
+                                           activity_broker_cb,
+                                           &g_activity_broker);
+            red_histogram_ip_set_base(hd, (uint32_t)hist_bases[i]);
         }
     }
 
@@ -466,6 +710,15 @@ static void r1mx_init(MachineState *machine)
 
     /* --- LCD TCP bridge (port 17186) ------------------------------------- */
     lcd_bridge_init(&g_lcd_bridge);
+
+    /* --- Activity broker (port 17187) ------------------------------------ */
+    activity_broker_init(&g_activity_broker);
+    if (g_activity_broker.listen_fd >= 0) {
+        fprintf(stderr,
+                "R1MX activity monitor: listening on TCP localhost:%d\n"
+                "  start GUI: python3 -m toolkit.gui.emulator\n",
+                ACTIVITY_TCP_PORT);
+    }
 
     (void)env; /* suppress unused-variable warning if no further env use */
 }

@@ -33,32 +33,44 @@
 #include "qemu/osdep.h"
 #include "hw/sysbus.h"
 #include "qom/object.h"
+#include "hw/ppc/r1mx_activity.h"
 
 #define TYPE_RED_HISTOGRAM_IP  "red.histogram-ip"
 OBJECT_DECLARE_SIMPLE_TYPE(RedHistogramIPState, RED_HISTOGRAM_IP)
 
 struct RedHistogramIPState {
-    SysBusDevice parent_obj;
-    MemoryRegion mmio;
+    SysBusDevice  parent_obj;
+    MemoryRegion  mmio;
+    /* Activity monitoring — set by r1mx_init() via red_histogram_ip_set_activity() */
+    R1mxActivityCb activity_cb;    /* NULL = disabled */
+    void          *activity_opaque;
+    uint8_t        dev_id;         /* R1MX_DEV_HIST_* */
+    uint32_t       base_addr;      /* guest physical base, filled at realize  */
 };
 
 static uint64_t red_hist_read(void *opaque, hwaddr offset, unsigned size)
 {
-    /* All reads return 0:
-     *   - Status bits (bit 5 at +0x3c) = 0  → firmware skips "enabled" path
-     *   - Histogram data registers = 0       → empty histogram buckets
-     *   - No IRQ pending bits set            → no spurious interrupts
-     */
-    return 0;
+    RedHistogramIPState *s = opaque;
+    uint64_t val = 0;
+    /* All reads return 0 (see file header for rationale). */
+    if (s->activity_cb) {
+        s->activity_cb(s->dev_id, R1MX_DIR_READ,
+                        s->base_addr + (uint32_t)offset, val, size,
+                        s->activity_opaque);
+    }
+    return val;
 }
 
 static void red_hist_write(void *opaque, hwaddr offset,
                            uint64_t val, unsigned size)
 {
-    /* Silently discard all writes.
-     * Observed writes: +0x38 ← 0x20 (enable?), +0x3c ← 0x20 (status clear?)
-     * Without real sensor data these writes have no useful effect.
-     */
+    RedHistogramIPState *s = opaque;
+    /* Silently discard all writes (see file header for rationale). */
+    if (s->activity_cb) {
+        s->activity_cb(s->dev_id, R1MX_DIR_WRITE,
+                        s->base_addr + (uint32_t)offset, val, size,
+                        s->activity_opaque);
+    }
 }
 
 static const MemoryRegionOps red_hist_ops = {
@@ -81,6 +93,8 @@ static void red_hist_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->mmio, OBJECT(s), &red_hist_ops, s,
                           TYPE_RED_HISTOGRAM_IP, 0x20000);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->mmio);
+    /* dev_id defaults to FPGA catch-all until r1mx_init sets a real one */
+    s->dev_id = R1MX_DEV_FPGA;
 }
 
 static void red_hist_class_init(ObjectClass *klass, void *data)
@@ -88,6 +102,30 @@ static void red_hist_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
     dc->realize = red_hist_realize;
     dc->desc    = "RED ONE MX FPGA histogram/waveform IP stub";
+}
+
+/*
+ * red_histogram_ip_set_activity — called by r1mx_init() after sysbus_mmio_map().
+ *
+ * base_addr must be the guest physical address that was passed to
+ * sysbus_mmio_map() so that offsets within the region can be reported as
+ * absolute guest addresses to the activity monitor.
+ */
+void red_histogram_ip_set_activity(DeviceState *dev, uint8_t dev_id,
+                                    R1mxActivityCb cb, void *opaque)
+{
+    RedHistogramIPState *s = RED_HISTOGRAM_IP(dev);
+    s->dev_id          = dev_id;
+    s->activity_cb     = cb;
+    s->activity_opaque = opaque;
+    /* base_addr is set by the separate red_histogram_ip_set_base() call,
+     * or we derive it from the mapped mmio region via sysbus internals.
+     * For simplicity the caller sets base_addr through the dedicated setter. */
+}
+
+void red_histogram_ip_set_base(DeviceState *dev, uint32_t base_addr)
+{
+    RED_HISTOGRAM_IP(dev)->base_addr = base_addr;
 }
 
 static const TypeInfo red_hist_info = {

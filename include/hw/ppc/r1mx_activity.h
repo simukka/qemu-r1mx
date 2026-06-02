@@ -1,0 +1,73 @@
+/*
+ * R1MX device activity reporting interface
+ *
+ * Provides a shared callback type and per-device constants used by the
+ * r1mx-virtex4 machine and its associated device models to route MMIO
+ * access events to the activity broker (TCP port 17187).
+ *
+ * Each device model that participates stores an R1mxActivityCb function
+ * pointer and a dev_id in its state struct.  r1mx_init() sets these via the
+ * per-device setter functions below.  When the r1mx machine is not in use
+ * the callback pointer is left NULL and all calls are no-ops.
+ *
+ * Copyright (c) 2026 r1mx reverse engineering project
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#ifndef HW_PPC_R1MX_ACTIVITY_H
+#define HW_PPC_R1MX_ACTIVITY_H
+
+#include <stdint.h>
+#include "hw/qdev-core.h"
+
+/* -------------------------------------------------------------------------
+ * Device IDs — indices into the GUI device list
+ * ---------------------------------------------------------------------- */
+#define R1MX_DEV_UART        0   /* XPS UARTLite       0xe0600000 */
+#define R1MX_DEV_ETHERNET    1   /* XPS EthernetLite   0xe1020000 */
+#define R1MX_DEV_DMA         2   /* OPB DMA Channel    0x64010000 */
+#define R1MX_DEV_HIST_LUMA   3   /* Luma Histogram     0xe0080000 */
+#define R1MX_DEV_HIST_RGB    4   /* RGB Histogram      0xe00a0000 */
+#define R1MX_DEV_HIST_RGBC   5   /* RGB Comp Histo     0xe0100000 */
+#define R1MX_DEV_HIST_MONO   6   /* Mono Histogram     0xe0120000 */
+#define R1MX_DEV_HIST_WAVE   7   /* Luma Waveform      0xe0200000 */
+#define R1MX_DEV_FPGA        8   /* FPGA catch-all     0xe0000000 */
+
+/* -------------------------------------------------------------------------
+ * Access direction
+ * ---------------------------------------------------------------------- */
+#define R1MX_DIR_READ    'R'
+#define R1MX_DIR_WRITE   'W'
+
+/* -------------------------------------------------------------------------
+ * Callback type
+ *
+ * dev_id : one of R1MX_DEV_* above
+ * dir    : R1MX_DIR_READ or R1MX_DIR_WRITE
+ * addr   : guest physical address of the access
+ * val    : value read or written (zero for reads that return 0)
+ * size   : access width in bytes (1, 2, or 4)
+ * opaque : caller-supplied context pointer (the R1mxActivityBroker)
+ * ---------------------------------------------------------------------- */
+typedef void (*R1mxActivityCb)(uint8_t dev_id, uint8_t dir,
+                                uint32_t addr, uint64_t val, unsigned size,
+                                void *opaque);
+
+/* -------------------------------------------------------------------------
+ * Per-device setter functions — defined in the respective device .c files,
+ * called by r1mx_init() after device realisation.
+ *
+ * Setting cb=NULL disables reporting (default state).
+ * ---------------------------------------------------------------------- */
+
+/* hw/misc/red_histogram_ip.c */
+void red_histogram_ip_set_activity(DeviceState *dev, uint8_t dev_id,
+                                    R1mxActivityCb cb, void *opaque);
+void red_histogram_ip_set_base(DeviceState *dev, uint32_t base_addr);
+
+/* hw/dma/xilinx_dma_opb.c */
+void xlnx_opb_dma_set_activity(DeviceState *dev, uint8_t dev_id,
+                                R1mxActivityCb cb, void *opaque);
+void xlnx_opb_dma_set_base(DeviceState *dev, uint32_t base_addr);
+
+#endif /* HW_PPC_R1MX_ACTIVITY_H */

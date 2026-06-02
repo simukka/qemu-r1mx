@@ -51,6 +51,7 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "exec/address-spaces.h"
+#include "hw/ppc/r1mx_activity.h"
 
 /* -------------------------------------------------------------------------
  * Register indices (byte_offset = index << 2)
@@ -126,10 +127,15 @@
 OBJECT_DECLARE_SIMPLE_TYPE(XilinxOPBDMA, XILINX_OPB_DMA)
 
 struct XilinxOPBDMA {
-    SysBusDevice parent_obj;
-    MemoryRegion mmio;
-    qemu_irq     irq;
-    uint32_t     regs[R_MAX];
+    SysBusDevice   parent_obj;
+    MemoryRegion   mmio;
+    qemu_irq       irq;
+    uint32_t       regs[R_MAX];
+    /* Activity monitoring — set by xlnx_opb_dma_set_activity() */
+    R1mxActivityCb activity_cb;    /* NULL = disabled */
+    void          *activity_opaque;
+    uint8_t        dev_id;         /* R1MX_DEV_DMA */
+    uint32_t       base_addr;      /* guest physical base address */
 };
 
 /* -------------------------------------------------------------------------
@@ -329,6 +335,7 @@ static uint64_t opb_dma_read(void *opaque, hwaddr offset, unsigned size)
 {
     XilinxOPBDMA *s   = opaque;
     unsigned      idx = offset >> 2;
+    uint64_t      val;
 
     if (idx >= R_MAX) {
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -337,7 +344,13 @@ static uint64_t opb_dma_read(void *opaque, hwaddr offset, unsigned size)
         return 0;
     }
 
-    return s->regs[idx];
+    val = s->regs[idx];
+    if (s->activity_cb) {
+        s->activity_cb(s->dev_id, R1MX_DIR_READ,
+                        s->base_addr + (uint32_t)offset, val, size,
+                        s->activity_opaque);
+    }
+    return val;
 }
 
 static void opb_dma_write(void *opaque, hwaddr offset,
@@ -352,6 +365,12 @@ static void opb_dma_write(void *opaque, hwaddr offset,
                       "xlnx.opb-dma: write 0x%08x at 0x%"HWADDR_PRIx
                       " out of range\n", v, offset);
         return;
+    }
+
+    if (s->activity_cb) {
+        s->activity_cb(s->dev_id, R1MX_DIR_WRITE,
+                        s->base_addr + (uint32_t)offset, val, size,
+                        s->activity_opaque);
     }
 
     switch (idx) {
@@ -476,3 +495,20 @@ static void opb_dma_register_types(void)
 }
 
 type_init(opb_dma_register_types)
+
+/* ---------------------------------------------------------------------------
+ * Activity monitoring setter — called by r1mx_init() after device creation.
+ * --------------------------------------------------------------------------- */
+void xlnx_opb_dma_set_activity(DeviceState *dev, uint8_t dev_id,
+                                R1mxActivityCb cb, void *opaque)
+{
+    XilinxOPBDMA *s    = XILINX_OPB_DMA(dev);
+    s->dev_id          = dev_id;
+    s->activity_cb     = cb;
+    s->activity_opaque = opaque;
+}
+
+void xlnx_opb_dma_set_base(DeviceState *dev, uint32_t base_addr)
+{
+    XILINX_OPB_DMA(dev)->base_addr = base_addr;
+}
