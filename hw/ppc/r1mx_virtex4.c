@@ -492,6 +492,53 @@ typedef struct R1mxState {
 DECLARE_INSTANCE_CHECKER(R1mxState, R1MX_MACHINE, TYPE_R1MX_MACHINE)
 
 /* ---------------------------------------------------------------------------
+ * Boot-environment fixups
+ *
+ * The RED ONE MX firmware (software.bin) is a RAM image loaded flat at phys 0x0
+ * via -device loader.  Three things the real camera's boot environment provides
+ * are absent in that flat-load model; we supply them here instead of patching
+ * the firmware binary (formerly patch_firmware.py #1/#2/#3, now retired):
+ *
+ *   #1  romInit (0x84) sets the early boot SP to 0x0000FFF0, which collides with
+ *       the loaded image (the deep usrInit call chain grows the stack down into
+ *       the exception vectors / low code).  On hardware romInit runs from flash
+ *       and low RAM is scratch.  Relocate the boot SP above the image by writing
+ *       `lis r1,0x800` (SP -> 0x07FFFFF0) at 0x84.
+ *
+ *   #2/#3  Early boot spins at 0x36C380 until the VxWorks canary words appear at
+ *       0xE269A0/0xE269A4 -- written by a separate init agent that does not run
+ *       in single-core emulation.  Seed the two canary VALUES so the spin exits
+ *       (no code NOP needed; this models the agent's effect).
+ *
+ * Run as a reset handler registered from a machine-init-done notifier, so it
+ * executes AFTER the -device loader has populated RAM, on every reset.
+ * --------------------------------------------------------------------------- */
+
+#define VXWORKS_CANARY_1_ADDR  0x00E269A4u   /* expects 0x12348765 */
+#define VXWORKS_CANARY_2_ADDR  0x00E269A0u   /* expects 0x5A5AC3C3 */
+
+static void r1mx_boot_env_fixup(void *opaque)
+{
+    /* All big-endian (PPC405). */
+    const uint8_t boot_sp_reloc[4] = { 0x3c, 0x20, 0x08, 0x00 }; /* lis r1,0x800 */
+    const uint8_t canary1[4]       = { 0x12, 0x34, 0x87, 0x65 };
+    const uint8_t canary2[4]       = { 0x5a, 0x5a, 0xc3, 0xc3 };
+
+    cpu_physical_memory_write(0x00000084u,        boot_sp_reloc, 4);
+    cpu_physical_memory_write(VXWORKS_CANARY_1_ADDR, canary1, 4);
+    cpu_physical_memory_write(VXWORKS_CANARY_2_ADDR, canary2, 4);
+}
+
+static void r1mx_machine_done(Notifier *n, void *opaque)
+{
+    /* Registered now (after all -device realization) so this reset handler runs
+     * after the loader's rom_reset on every system reset. */
+    qemu_register_reset(r1mx_boot_env_fixup, NULL);
+}
+
+static Notifier r1mx_machine_done_notifier = { .notify = r1mx_machine_done };
+
+/* ---------------------------------------------------------------------------
  * Machine initialisation
  * --------------------------------------------------------------------------- */
 
@@ -528,6 +575,10 @@ static void r1mx_init(MachineState *machine)
 
     /* Register a CPU reset handler — same pattern as ppc440_bamboo.c */
     qemu_register_reset((QEMUResetHandler *)cpu_reset, cpu);
+
+    /* Apply the boot-environment fixups (boot SP relocate + VxWorks canaries)
+     * after -device loader has populated RAM.  See r1mx_boot_env_fixup above. */
+    qemu_add_machine_init_done_notifier(&r1mx_machine_done_notifier);
 
     /* Connect the PPC405 external interrupt to the XIntc below */
     cpu_irq = qdev_get_gpio_in(DEVICE(cpu), PPC40x_INPUT_INT);
