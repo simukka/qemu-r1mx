@@ -32,6 +32,11 @@
 #define R1MX_DEV_HIST_MONO   6   /* Mono Histogram     0xe0120000 */
 #define R1MX_DEV_HIST_WAVE   7   /* Luma Waveform      0xe0200000 */
 #define R1MX_DEV_FPGA        8   /* FPGA catch-all     0xe0000000 */
+#define R1MX_DEV_CPU         9   /* PPC405F6 CPU sampler           */
+#define R1MX_DEV_RAM        10   /* System RAM         0x00000000 */
+#define R1MX_DEV_ROM        11   /* NOR flash + boot ROM spy       */
+#define R1MX_DEV_SDCARD     12   /* Block backend slot 0 (CF/SD)   */
+#define R1MX_DEV_SSD        13   /* Block backend slot 1 (SSD)     */
 
 /* -------------------------------------------------------------------------
  * Access direction

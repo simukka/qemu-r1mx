@@ -57,13 +57,17 @@
 #include "hw/qdev-properties.h"
 #include "hw/qdev-properties-system.h"
 #include "hw/misc/unimp.h"
+#include "hw/loader.h"
 #include "exec/address-spaces.h"
 #include "sysemu/sysemu.h"
 #include "sysemu/reset.h"
+#include "sysemu/runstate.h"
 #include "net/net.h"
 #include "qemu/main-loop.h"
 #include "qemu/timer.h"
 #include "hw/ppc/r1mx_activity.h"
+#include "sysemu/block-backend.h"
+#include "block/accounting.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -266,6 +270,18 @@ typedef struct R1mxActivityBroker {
 static R1mxActivityBroker g_activity_broker = { .listen_fd = -1,
                                                  .client_fd = -1 };
 
+/* Forward declarations — sampler symbols are defined further below but are
+ * referenced in activity_broker_accept which must precede them in the file. */
+#define CPU_SAMPLE_NS_FWD    500000ULL
+#define BLOCK_SAMPLE_NS_FWD  10000000ULL
+typedef struct R1mxCpuSampler {
+    QEMUTimer  *timer;
+    PowerPCCPU *cpu;
+} R1mxCpuSampler;
+static R1mxCpuSampler  g_cpu_sampler;
+static QEMUTimer      *g_block_sampler_timer;
+static bool            g_samplers_enabled = false;
+
 static void activity_broker_accept(void *opaque)
 {
     R1mxActivityBroker *br = opaque;
@@ -280,6 +296,16 @@ static void activity_broker_accept(void *opaque)
     {
         int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    }
+    /* Start the samplers now that a client is connected, but only when
+     * -machine …,activity-samplers=on was given.  Both timers are
+     * self-stopping (they check client_fd in their tick) so they cease
+     * automatically if the client later disconnects. */
+    if (g_samplers_enabled) {
+        timer_mod(g_cpu_sampler.timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + CPU_SAMPLE_NS_FWD);
+        timer_mod(g_block_sampler_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + BLOCK_SAMPLE_NS_FWD);
     }
 }
 
@@ -387,10 +413,11 @@ static void activity_broker_cb(uint8_t dev_id, uint8_t dir,
  * satisfy this requirement.
  * --------------------------------------------------------------------------- */
 typedef struct R1mxSpyRegion {
-    MemoryRegion  mr;
-    MemoryRegion *real_mr;   /* the real device's MMIO region */
-    uint8_t       dev_id;
-    uint32_t      base;      /* guest physical base address   */
+    MemoryRegion       mr;
+    MemoryRegion      *real_mr;   /* the real device's MMIO region */
+    uint8_t            dev_id;
+    uint32_t           base;      /* guest physical base address   */
+    MemoryRegionOps    ops;       /* per-instance copy so endianness/size can vary */
 } R1mxSpyRegion;
 
 static uint64_t spy_read(void *opaque, hwaddr offset, unsigned size)
@@ -418,28 +445,59 @@ static void spy_write(void *opaque, hwaddr offset,
     }
 }
 
-static const MemoryRegionOps spy_ops = {
-    .read       = spy_read,
-    .write      = spy_write,
-    .endianness = DEVICE_BIG_ENDIAN,
-    .valid = {
-        .min_access_size = 1,
-        .max_access_size = 4,
-    },
-};
-
-/* Allocate and install a spy region over [base, base+size). */
+/* Allocate and install a spy region over [base, base+size).
+ * The spy's ops are initialised to exactly match the real device's declared
+ * endianness and valid access-size constraints so QEMU's memory dispatch
+ * layer applies the same byte-swap and size-splitting logic for both. */
 static void install_spy(MemoryRegion *sysmem, SysBusDevice *sbd,
                          unsigned mmio_idx, hwaddr base, uint64_t spy_size,
-                         uint8_t dev_id)
+                         uint8_t dev_id, const char *name)
 {
     R1mxSpyRegion *spy = g_new0(R1mxSpyRegion, 1);
     spy->real_mr = sysbus_mmio_get_region(sbd, mmio_idx);
     spy->dev_id  = dev_id;
     spy->base    = (uint32_t)base;
-    memory_region_init_io(&spy->mr, NULL, &spy_ops, spy,
-                           "r1mx.spy", spy_size);
+    /* Mirror the real device's endianness and access-size constraints exactly
+     * so the dispatch layer applies identical byte-swapping to the spy as it
+     * would to the real region.  Without this the guest sees double-swapped
+     * register values on a little-endian host. */
+    spy->ops.read            = spy_read;
+    spy->ops.write           = spy_write;
+    spy->ops.endianness      = spy->real_mr->ops->endianness;
+    spy->ops.valid.min_access_size =
+        spy->real_mr->ops->valid.min_access_size
+        ? spy->real_mr->ops->valid.min_access_size : 1;
+    spy->ops.valid.max_access_size =
+        spy->real_mr->ops->valid.max_access_size
+        ? spy->real_mr->ops->valid.max_access_size : 4;
+    memory_region_init_io(&spy->mr, NULL, &spy->ops, spy, name, spy_size);
     /* priority 1 > default 0: spy wins over the real device region */
+    memory_region_add_subregion_overlap(sysmem, base, &spy->mr, 1);
+}
+
+/*
+ * install_spy_mr — same as install_spy but takes a plain MemoryRegion pointer
+ * directly rather than a SysBusDevice MMIO slot.  Used to wrap NOR flash and
+ * boot ROM regions that are not sysbus devices.
+ */
+static void install_spy_mr(MemoryRegion *sysmem, MemoryRegion *real_mr,
+                            hwaddr base, uint64_t spy_size, uint8_t dev_id,
+                            const char *name)
+{
+    R1mxSpyRegion *spy = g_new0(R1mxSpyRegion, 1);
+    spy->real_mr = real_mr;
+    spy->dev_id  = dev_id;
+    spy->base    = (uint32_t)base;
+    spy->ops.read            = spy_read;
+    spy->ops.write           = spy_write;
+    spy->ops.endianness      = real_mr->ops->endianness;
+    spy->ops.valid.min_access_size =
+        real_mr->ops->valid.min_access_size
+        ? real_mr->ops->valid.min_access_size : 1;
+    spy->ops.valid.max_access_size =
+        real_mr->ops->valid.max_access_size
+        ? real_mr->ops->valid.max_access_size : 4;
+    memory_region_init_io(&spy->mr, NULL, &spy->ops, spy, name, spy_size);
     memory_region_add_subregion_overlap(sysmem, base, &spy->mr, 1);
 }
 
@@ -486,10 +544,118 @@ typedef struct R1mxState {
     MachineState    parent;
     /* No embedded SoC: we use a bare PPC405 CPU to avoid serial_hd conflicts
      * from the OPB UARTs inside Ppc405SoCState.  See design note above. */
+    bool            activity_samplers; /* -machine …,activity-samplers=on */
 } R1mxState;
 
 #define TYPE_R1MX_MACHINE   MACHINE_TYPE_NAME("r1mx-virtex4")
 DECLARE_INSTANCE_CHECKER(R1mxState, R1MX_MACHINE, TYPE_R1MX_MACHINE)
+
+/* ---------------------------------------------------------------------------
+ * CPU + RAM periodic activity sampler
+ *
+ * A QEMUTimer fires every CPU_SAMPLE_NS of virtual time (only while the VM
+ * is running) and emits:
+ *   R1MX_DEV_CPU  addr=current PC,  value=1 running / 0 halted, dir='R'
+ *   R1MX_DEV_RAM  addr=current PC,  value=1,                    dir='R'
+ *                 (only when CPU is running — implies instruction fetch)
+ *
+ * Using QEMU_CLOCK_VIRTUAL means the timer advances only while the guest
+ * clock ticks, so no spurious packets are sent when the machine is paused.
+ * --------------------------------------------------------------------------- */
+#define CPU_SAMPLE_NS  500000ULL   /* 500 µs virtual time between samples */
+
+static void cpu_sampler_tick(void *opaque)
+{
+    R1mxCpuSampler *s      = (R1mxCpuSampler *)opaque;
+    CPUState       *cs     = CPU(s->cpu);
+    uint32_t        pc     = (uint32_t)s->cpu->env.nip;
+    int             halted = cs->halted || cs->stopped;
+
+    activity_broker_send(&g_activity_broker, R1MX_DEV_CPU, R1MX_DIR_READ,
+                          pc, halted ? 0u : 1u, 4);
+
+    if (!halted) {
+        activity_broker_send(&g_activity_broker, R1MX_DEV_RAM, R1MX_DIR_READ,
+                              pc, 1, 4);
+    }
+
+    /* Only reschedule while a GUI client is connected; timer stops otherwise
+     * so there is zero overhead on the emulator when no client is attached. */
+    if (g_activity_broker.client_fd >= 0) {
+        timer_mod(s->timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + CPU_SAMPLE_NS);
+    }
+}
+
+static void cpu_sampler_init(R1mxCpuSampler *s, PowerPCCPU *cpu)
+{
+    s->cpu   = cpu;
+    s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, cpu_sampler_tick, s);
+    /* Timer is NOT armed here.  It is started by activity_broker_accept()
+     * when the first GUI client connects, and stops itself in
+     * cpu_sampler_tick() when the client disconnects.  This ensures zero
+     * timer overhead when no monitor is open. */
+}
+
+/* ---------------------------------------------------------------------------
+ * Block-device activity sampler
+ *
+ * Polls BlockAcctStats on attached block backends every BLOCK_SAMPLE_NS of
+ * real time.  The first backend maps to R1MX_DEV_SDCARD (CF / SD recording
+ * media), the second to R1MX_DEV_SSD (SiI3512 SATA SSD bay).
+ *
+ * Direction R1MX_DIR_READ  → bytes read  since last tick (value = KB)
+ * Direction R1MX_DIR_WRITE → bytes written since last tick (value = KB)
+ * addr = 0 (block devices have no single MMIO address)
+ *
+ * Uses QEMU_CLOCK_REALTIME so block I/O during guest pause is still visible.
+ * --------------------------------------------------------------------------- */
+#define BLOCK_SAMPLE_NS  10000000ULL   /* 10 ms real time between polls */
+
+static uint64_t         g_blk_rd[2];         /* last-sampled nr_bytes read  */
+static uint64_t         g_blk_wr[2];         /* last-sampled nr_bytes write */
+static const uint8_t    g_blk_dev_ids[2] = { R1MX_DEV_SDCARD, R1MX_DEV_SSD };
+
+static void block_sampler_tick(void *opaque)
+{
+    BlockBackend *blk  = NULL;
+    int           slot = 0;
+
+    while ((blk = blk_next(blk)) != NULL && slot < 2) {
+        BlockAcctStats *stats = blk_get_stats(blk);
+        uint8_t  dev_id = g_blk_dev_ids[slot];
+        uint64_t rd     = stats->nr_bytes[BLOCK_ACCT_READ];
+        uint64_t wr     = stats->nr_bytes[BLOCK_ACCT_WRITE];
+
+        if (rd > g_blk_rd[slot]) {
+            /* value = KB read (>>10), clamped to 32 bits */
+            uint64_t delta = rd - g_blk_rd[slot];
+            activity_broker_send(&g_activity_broker, dev_id, R1MX_DIR_READ,
+                                  0, (uint32_t)(delta >> 10), 4);
+            g_blk_rd[slot] = rd;
+        }
+        if (wr > g_blk_wr[slot]) {
+            uint64_t delta = wr - g_blk_wr[slot];
+            activity_broker_send(&g_activity_broker, dev_id, R1MX_DIR_WRITE,
+                                  0, (uint32_t)(delta >> 10), 4);
+            g_blk_wr[slot] = wr;
+        }
+        slot++;
+    }
+
+    /* Only reschedule while a GUI client is connected. */
+    if (g_activity_broker.client_fd >= 0) {
+        timer_mod(g_block_sampler_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + BLOCK_SAMPLE_NS);
+    }
+}
+
+static void block_sampler_init(void)
+{
+    g_block_sampler_timer = timer_new_ns(QEMU_CLOCK_REALTIME,
+                                          block_sampler_tick, NULL);
+    /* Not armed at startup — started by activity_broker_accept(). */
+}
 
 /* ---------------------------------------------------------------------------
  * Boot-environment fixups
@@ -517,26 +683,33 @@ DECLARE_INSTANCE_CHECKER(R1mxState, R1MX_MACHINE, TYPE_R1MX_MACHINE)
 #define VXWORKS_CANARY_1_ADDR  0x00E269A4u   /* expects 0x12348765 */
 #define VXWORKS_CANARY_2_ADDR  0x00E269A0u   /* expects 0x5A5AC3C3 */
 
-static void r1mx_boot_env_fixup(void *opaque)
+/* Apply the boot-environment fixups directly to RAM.  Run from a VM-state-change
+ * handler on the transition to RUNNING: this fires after the -device loader's
+ * force-raw load_image_targphys has populated RAM (which in this QEMU happens
+ * after machine-init-done and after reset), and before the vCPU executes, so the
+ * boot SP relocation is in place before romInit fetches it. */
+static void r1mx_apply_boot_env_fixups(void *opaque, bool running, RunState state)
 {
-    /* All big-endian (PPC405). */
-    const uint8_t boot_sp_reloc[4] = { 0x3c, 0x20, 0x08, 0x00 }; /* lis r1,0x800 */
-    const uint8_t canary1[4]       = { 0x12, 0x34, 0x87, 0x65 };
-    const uint8_t canary2[4]       = { 0x5a, 0x5a, 0xc3, 0xc3 };
+    static const uint8_t boot_sp_reloc[4] = { 0x3c, 0x20, 0x08, 0x00 }; /* lis r1,0x800 */
+    static const uint8_t canary1[4]       = { 0x12, 0x34, 0x87, 0x65 };
+    static const uint8_t canary2[4]       = { 0x5a, 0x5a, 0xc3, 0xc3 };
 
-    cpu_physical_memory_write(0x00000084u,        boot_sp_reloc, 4);
+    uint8_t at84[4];
+
+    if (!running) {
+        return;
+    }
+    /* Only fix up when THIS firmware is actually loaded: 0x84 must hold romInit's
+     * original `lis r1,1` (3c200001).  Guards device-only / no-firmware runs
+     * (RAM is zero) and avoids re-applying once we've already relocated. */
+    cpu_physical_memory_read(0x00000084u, at84, 4);
+    if (at84[0] != 0x3c || at84[1] != 0x20 || at84[2] != 0x00 || at84[3] != 0x01) {
+        return;
+    }
+    cpu_physical_memory_write(0x00000084u,          boot_sp_reloc, 4);
     cpu_physical_memory_write(VXWORKS_CANARY_1_ADDR, canary1, 4);
     cpu_physical_memory_write(VXWORKS_CANARY_2_ADDR, canary2, 4);
 }
-
-static void r1mx_machine_done(Notifier *n, void *opaque)
-{
-    /* Registered now (after all -device realization) so this reset handler runs
-     * after the loader's rom_reset on every system reset. */
-    qemu_register_reset(r1mx_boot_env_fixup, NULL);
-}
-
-static Notifier r1mx_machine_done_notifier = { .notify = r1mx_machine_done };
 
 /* ---------------------------------------------------------------------------
  * Machine initialisation
@@ -552,6 +725,9 @@ static void r1mx_init(MachineState *machine)
     qemu_irq     intc_irqs[32];
     qemu_irq     cpu_irq;
     int          i;
+
+    /* Latch the activity-samplers flag before any device init. */
+    g_samplers_enabled = R1MX_MACHINE(machine)->activity_samplers;
 
     /* --- Bare PPC405 CPU ------------------------------------------------- */
     cpu = POWERPC_CPU(cpu_create(machine->cpu_type));
@@ -576,9 +752,12 @@ static void r1mx_init(MachineState *machine)
     /* Register a CPU reset handler — same pattern as ppc440_bamboo.c */
     qemu_register_reset((QEMUResetHandler *)cpu_reset, cpu);
 
-    /* Apply the boot-environment fixups (boot SP relocate + VxWorks canaries)
-     * after -device loader has populated RAM.  See r1mx_boot_env_fixup above. */
-    qemu_add_machine_init_done_notifier(&r1mx_machine_done_notifier);
+    /* CPU + RAM activity sampler — fires every 5 ms virtual time */
+    cpu_sampler_init(&g_cpu_sampler, cpu);
+
+    /* Boot-environment fixups (boot SP relocate + VxWorks canaries) applied after
+     * the -device loader populates RAM, before the vCPU runs.  See above. */
+    qemu_add_vm_change_state_handler(r1mx_apply_boot_env_fixups, NULL);
 
     /* Connect the PPC405 external interrupt to the XIntc below */
     cpu_irq = qdev_get_gpio_in(DEVICE(cpu), PPC40x_INPUT_INT);
@@ -619,7 +798,8 @@ static void r1mx_init(MachineState *machine)
         sysbus_connect_irq(uart_sbd, 0, intc_irqs[IRQ_UARTLITE]);
         /* Spy region intercepts all UARTLite accesses for the activity monitor.
          * UARTLite register space is 16 bytes (4 regs × 4 bytes). */
-        install_spy(sysmem, uart_sbd, 0, UARTLITE_BASE, 0x10, R1MX_DEV_UART);
+        install_spy(sysmem, uart_sbd, 0, UARTLITE_BASE, 0x10, R1MX_DEV_UART,
+                     "xlnx.xps-uartlite");
     }
 
     /* --- XPS EthernetLite (WDB UDP 17185) -------------------------------- */
@@ -636,7 +816,8 @@ static void r1mx_init(MachineState *machine)
         sysbus_connect_irq(eth_sbd, 0, intc_irqs[IRQ_ETHLITE]);
         /* Spy region covers the full dual-buffer ping-pong address space
          * (Xilinx DS599: 0x20000 bytes for 2×TX + 2×RX + control regs). */
-        install_spy(sysmem, eth_sbd, 0, ETHLITE_BASE, 0x20000, R1MX_DEV_ETHERNET);
+        install_spy(sysmem, eth_sbd, 0, ETHLITE_BASE, 0x20000, R1MX_DEV_ETHERNET,
+                     "xlnx.xps-ethernetlite");
     }
 
     /* --- Unimplemented / stub regions ------------------------------------ */
@@ -736,12 +917,16 @@ static void r1mx_init(MachineState *machine)
         memory_region_init_io(nor, NULL, &nor_flash_ops, NULL,
                               "nor-flash", NOR_FLASH_SIZE);
         memory_region_add_subregion(sysmem, NOR_FLASH_BASE, nor);
+        install_spy_mr(sysmem, nor, NOR_FLASH_BASE, NOR_FLASH_SIZE,
+                        R1MX_DEV_ROM, "nor-flash");
     }
     {
         MemoryRegion *rom = g_new(MemoryRegion, 1);
         memory_region_init_io(rom, NULL, &nor_flash_ops, NULL,
                               "boot-rom", BOOT_ROM_SIZE);
         memory_region_add_subregion(sysmem, BOOT_ROM_BASE, rom);
+        install_spy_mr(sysmem, rom, BOOT_ROM_BASE, BOOT_ROM_SIZE,
+                        R1MX_DEV_ROM, "boot-rom");
     }
 
     /* --- FPGA fabric catch-all (64 MB at 0xe0000000-0xe3ffffff) ----------
@@ -770,6 +955,9 @@ static void r1mx_init(MachineState *machine)
                 ACTIVITY_TCP_PORT);
     }
 
+    /* --- Block-device activity sampler (SD card + SSD) ------------------- */
+    block_sampler_init();
+
     (void)env; /* suppress unused-variable warning if no further env use */
 }
 
@@ -777,9 +965,26 @@ static void r1mx_init(MachineState *machine)
  * Machine class
  * --------------------------------------------------------------------------- */
 
+static bool r1mx_get_activity_samplers(Object *obj, Error **errp)
+{
+    return R1MX_MACHINE(obj)->activity_samplers;
+}
+
+static void r1mx_set_activity_samplers(Object *obj, bool value, Error **errp)
+{
+    R1MX_MACHINE(obj)->activity_samplers = value;
+}
+
 static void r1mx_machine_class_init(ObjectClass *oc, void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
+
+    object_class_property_add_bool(oc, "activity-samplers",
+                                   r1mx_get_activity_samplers,
+                                   r1mx_set_activity_samplers);
+    object_class_property_set_description(oc, "activity-samplers",
+        "Enable periodic CPU-PC and block-device activity samplers "
+        "(adds ~500 µs virtual timer overhead; off by default)");
 
     mc->desc         = "RED ONE MX (Xilinx Virtex-4 FX, PPC405F6, VxWorks)";
     mc->init         = r1mx_init;
