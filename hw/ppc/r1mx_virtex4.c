@@ -643,8 +643,7 @@ static void r1mx_init(MachineState *machine)
             R1MX_DEV_HIST_MONO,
             R1MX_DEV_HIST_WAVE,
         };
-        unsigned i;
-        for (i = 0; i < ARRAY_SIZE(hist_bases); i++) {
+        for (i = 0; i < (int)ARRAY_SIZE(hist_bases); i++) {
             DeviceState  *hd = qdev_new("red.histogram-ip");
             SysBusDevice *hs = SYS_BUS_DEVICE(hd);
             sysbus_realize_and_unref(hs, &error_fatal);
