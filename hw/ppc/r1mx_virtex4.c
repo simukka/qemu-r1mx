@@ -676,12 +676,35 @@ static void block_sampler_init(void)
  *       in single-core emulation.  Seed the two canary VALUES so the spin exits
  *       (no code NOP needed; this models the agent's effect).
  *
+ *   #4/#5  Root-task dispatch.  FUN_00371cd0 (task-context setup) branches:
+ *       `if (*0xE3A790 == TCB+0x94)` -> IF-path saves PC = 0x381A8C (a mid-routine
+ *       address in the OpenSSL X.509 code; the "artifact dispatch" that firmware
+ *       patches #53/55 produce -- NEITHER the original 0x381AEC nor the patched
+ *       0x381A8C is a real trampoline); ELSE-path saves PC = TCB+0xC0 (the task's
+ *       own entry, = usrRoot 0x37C440 for the root task -- verified static).
+ *       TCB+0x94 is COPIED from *0xE3A790 at task setup, so seeding the selector
+ *       can't break the match (it propagates).  On hardware *0xE3A790 changes
+ *       between root-task creation and its first dispatch (live value 0x00FC9580,
+ *       no static writer) so the root task takes the else-path; that timing can't
+ *       be reproduced by a static seed.  Instead we FORCE the else-path: patch the
+ *       branch `bne 0x371D78` (4082001C) at 0x371D5C to `b 0x371D78` (4800001C),
+ *       so every task dispatches to its own TCB+0xC0 entry (normal VxWorks
+ *       behaviour; the if-path artifact + patches #53/55 become dead code).  The
+ *       else-path calls *0xE293F4 only if non-zero; the stale .data 0x542974 (a
+ *       function epilogue) would crash, so seed *0xE293F4 = 0 (the live value) to
+ *       skip it.  This makes the NATURAL firmware dispatch reach usrRoot with a
+ *       real task context, replacing firmware patches #53/55.  (Dispatch logic
+ *       harvested/verified against live cam-working-01, 2026-06-14; see
+ *       boot_reconstruction_status.md.)
+ *
  * Run as a reset handler registered from a machine-init-done notifier, so it
  * executes AFTER the -device loader has populated RAM, on every reset.
  * --------------------------------------------------------------------------- */
 
 #define VXWORKS_CANARY_1_ADDR  0x00E269A4u   /* expects 0x12348765 */
 #define VXWORKS_CANARY_2_ADDR  0x00E269A0u   /* expects 0x5A5AC3C3 */
+#define DISPATCH_BRANCH_ADDR   0x00371D5Cu   /* bne 0x371D78 -> b (force else-path) */
+#define DISPATCH_FNPTR_ADDR    0x00E293F4u   /* *0xE293F4: NULL -> skip stale call  */
 
 /* Apply the boot-environment fixups directly to RAM.  Run from a VM-state-change
  * handler on the transition to RUNNING: this fires after the -device loader's
@@ -693,6 +716,8 @@ static void r1mx_apply_boot_env_fixups(void *opaque, bool running, RunState stat
     static const uint8_t boot_sp_reloc[4] = { 0x3c, 0x20, 0x08, 0x00 }; /* lis r1,0x800 */
     static const uint8_t canary1[4]       = { 0x12, 0x34, 0x87, 0x65 };
     static const uint8_t canary2[4]       = { 0x5a, 0x5a, 0xc3, 0xc3 };
+    static const uint8_t disp_force_else[4]= { 0x48, 0x00, 0x00, 0x1c }; /* b 0x371D78   */
+    static const uint8_t disp_fnptr[4]    = { 0x00, 0x00, 0x00, 0x00 }; /* NULL -> skip  */
 
     uint8_t at84[4];
 
@@ -706,9 +731,11 @@ static void r1mx_apply_boot_env_fixups(void *opaque, bool running, RunState stat
     if (at84[0] != 0x3c || at84[1] != 0x20 || at84[2] != 0x00 || at84[3] != 0x01) {
         return;
     }
-    cpu_physical_memory_write(0x00000084u,          boot_sp_reloc, 4);
-    cpu_physical_memory_write(VXWORKS_CANARY_1_ADDR, canary1, 4);
-    cpu_physical_memory_write(VXWORKS_CANARY_2_ADDR, canary2, 4);
+    cpu_physical_memory_write(0x00000084u,           boot_sp_reloc, 4);
+    cpu_physical_memory_write(VXWORKS_CANARY_1_ADDR,  canary1, 4);
+    cpu_physical_memory_write(VXWORKS_CANARY_2_ADDR,  canary2, 4);
+    cpu_physical_memory_write(DISPATCH_BRANCH_ADDR,   disp_force_else, 4);
+    cpu_physical_memory_write(DISPATCH_FNPTR_ADDR,    disp_fnptr, 4);
 }
 
 /* ---------------------------------------------------------------------------
