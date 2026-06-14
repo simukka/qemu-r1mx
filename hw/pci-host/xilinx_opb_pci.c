@@ -62,6 +62,7 @@
 #include "hw/sysbus.h"
 #include "qom/object.h"
 #include "qemu/log.h"
+#include "exec/address-spaces.h"
 
 /* -------------------------------------------------------------------------
  * Register indices (offset / 4)
@@ -111,6 +112,56 @@ static const uint32_t bridge_cfg[64] = {
 };
 
 /* -------------------------------------------------------------------------
+ * Philips ISP1562 USB host controller (PCI leaf devices)
+ *
+ * The Build-32 cold-boot device enumerator (FUN_00367f54, reached lazily from
+ * the usrRoot device-init cascade) scans PCI config for USB host controllers
+ * and BREAKS on the first empty slot; finding none leaves the device count
+ * (.data 0xE26978) at 0, so FUN_00563B58 builds no device contexts and the
+ * keystone allocator FUN_005651E8/0x5652D0 returns -7.  See
+ * firmware/reverse/build_32/boot_reconstruction_status.md ("ROOT CAUSE
+ * LOCALIZED", 2026-06-13) and plans/qemu_xilinx_drivers.md Phase 2.
+ *
+ * The enumerator runs two scans: loop 1 matches 24-bit class 0x0C03A0, loop 2
+ * matches 0x0C0320 (USB EHCI).  We expose two single-function devices so both
+ * loops find a controller:
+ *     bus 0 / dev 1 / fn 0  -> class 0x0C03A0  (no BAR probe in loop 1)
+ *     bus 0 / dev 2 / fn 0  -> class 0x0C0320  (loop 2 enables + reads BAR0)
+ *
+ * Loop 2 enables the device (cmd |= Mem|BusMaster), reads BAR0, then reads the
+ * device register at BAR0+offset+8; only if (read>>8)&0xff > 0x40 does it issue
+ * a reset and poll.  We back BAR0 with a register block that reads as 0, so the
+ * (>>8)&0xff test is 0 and the reset/poll path is skipped.
+ *
+ * Config dword layout matches the firmware read path (CDR returns the 32-bit
+ * word; FUN_00000b3c does (cfg[0x08]>>8) == class).  VID/DID 0x04CC:0x1562.
+ * ---------------------------------------------------------------------- */
+#define ISP_BAR0_BASE   0xA0000000u   /* in PCI memory window 0 (pci-mem0) */
+#define ISP_BAR0_SIZE   0x1000u
+
+#define ISP_DEV_A       1u            /* class 0x0C03A0 (loop 1)            */
+#define ISP_DEV_B       2u            /* class 0x0C0320 (loop 2, has BAR0)  */
+
+static const uint32_t isp1562_cfg_a[64] = {
+    [0x00/4] = 0x156204CC,   /* device=0x1562, vendor=0x04CC (Philips)      */
+    [0x04/4] = 0x02B00000,   /* status (DEVSEL medium), command=0           */
+    [0x08/4] = 0x0C03A001,   /* class 0x0C03A0 (USB host), rev 1            */
+    [0x0C/4] = 0x00000000,   /* hdr type 0, single function                 */
+    [0x2C/4] = 0x156204CC,   /* subsystem id/vendor                         */
+    [0x3C/4] = 0x00000100,   /* irq_pin=INTA                                */
+};
+
+static const uint32_t isp1562_cfg_b[64] = {
+    [0x00/4] = 0x156204CC,   /* device=0x1562, vendor=0x04CC (Philips)      */
+    [0x04/4] = 0x02B00000,   /* status (DEVSEL medium), command=0           */
+    [0x08/4] = 0x0C032001,   /* class 0x0C0320 (USB EHCI), rev 1            */
+    [0x0C/4] = 0x00000000,   /* hdr type 0, single function                 */
+    [0x10/4] = ISP_BAR0_BASE,/* BAR0: 32-bit memory at 0xA0000000           */
+    [0x2C/4] = 0x156204CC,   /* subsystem id/vendor                         */
+    [0x3C/4] = 0x00000100,   /* irq_pin=INTA                                */
+};
+
+/* -------------------------------------------------------------------------
  * Device type
  * ---------------------------------------------------------------------- */
 #define TYPE_XILINX_OPB_PCI  "xlnx.opb-pci-host"
@@ -119,7 +170,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(XilinxOpbPciState, XILINX_OPB_PCI)
 struct XilinxOpbPciState {
     SysBusDevice  parent_obj;
     MemoryRegion  mmio;
+    MemoryRegion  isp_bar0;       /* ISP1562 dev B BAR0 register block */
     uint32_t      regs[R_MAX];
+    uint16_t      isp_a_cmd;      /* shadow of dev A PCI command reg   */
+    uint16_t      isp_b_cmd;      /* shadow of dev B PCI command reg   */
 };
 
 /* -------------------------------------------------------------------------
@@ -139,16 +193,62 @@ static uint32_t opb_pci_config_read(XilinxOpbPciState *s)
     unsigned fn   = (car >>  8) & 0x07;
     unsigned reg  = (car & 0xFC) >> 2;   /* dword index */
 
-    /* Only the host bridge itself lives on bus 0, device 0, function 0 */
-    if (bus == 0 && dev == 0 && fn == 0) {
-        if (reg < ARRAY_SIZE(bridge_cfg)) {
-            return bridge_cfg[reg];
-        }
-        return 0x00000000U;
+    if (bus != 0 || fn != 0) {
+        return 0xFFFFFFFFU;          /* only bus 0, function 0 populated */
     }
 
-    /* All other slots: device not present */
-    return 0xFFFFFFFFU;
+    /* Host bridge itself: bus 0, device 0, function 0 */
+    if (dev == 0) {
+        return reg < ARRAY_SIZE(bridge_cfg) ? bridge_cfg[reg] : 0x00000000U;
+    }
+
+    /* ISP1562 USB host controllers (see notes above) */
+    if (dev == ISP_DEV_A && reg < ARRAY_SIZE(isp1562_cfg_a)) {
+        uint32_t v = isp1562_cfg_a[reg];
+        if (reg == 0x04/4) {
+            v = (v & 0xFFFF0000U) | s->isp_a_cmd;   /* live command reg */
+        }
+        return v;
+    }
+    if (dev == ISP_DEV_B && reg < ARRAY_SIZE(isp1562_cfg_b)) {
+        uint32_t v = isp1562_cfg_b[reg];
+        if (reg == 0x04/4) {
+            v = (v & 0xFFFF0000U) | s->isp_b_cmd;   /* live command reg */
+        }
+        return v;
+    }
+
+    /* Populated device, register beyond table, or empty slot */
+    if (dev == ISP_DEV_A || dev == ISP_DEV_B) {
+        return 0x00000000U;
+    }
+    return 0xFFFFFFFFU;              /* device not present */
+}
+
+/* Config write cycle (CDR write).  We only honour the PCI command register so
+ * the enumerator's "enable Mem+BusMaster" (cmd |= 6) sticks; BAR writes (size
+ * probing) and everything else are ignored — BARs are fixed. */
+static void opb_pci_config_write(XilinxOpbPciState *s, uint32_t val)
+{
+    uint32_t car = s->regs[R_CAR];
+
+    if (!(car & 0x80000000U)) {
+        return;
+    }
+    if (((car >> 16) & 0xFF) != 0 || ((car >> 8) & 0x07) != 0) {
+        return;
+    }
+
+    unsigned dev = (car >> 11) & 0x1F;
+    unsigned reg = (car & 0xFC) >> 2;
+
+    if (reg == 0x04/4) {
+        if (dev == ISP_DEV_A) {
+            s->isp_a_cmd = (uint16_t)val;
+        } else if (dev == ISP_DEV_B) {
+            s->isp_b_cmd = (uint16_t)val;
+        }
+    }
 }
 
 /* -------------------------------------------------------------------------
@@ -189,8 +289,9 @@ static void opb_pci_write(void *opaque, hwaddr offset,
         return;
     }
 
-    /* CDR write: config write cycle (discarded — we have no real devices) */
+    /* CDR write: config write cycle */
     if (idx == R_CDR) {
+        opb_pci_config_write(s, (uint32_t)val);
         return;
     }
 
@@ -206,9 +307,44 @@ static void opb_pci_write(void *opaque, hwaddr offset,
 static const MemoryRegionOps opb_pci_ops = {
     .read       = opb_pci_read,
     .write      = opb_pci_write,
-    .endianness = DEVICE_BIG_ENDIAN,
+    /* The XPci/V3 bridge registers (CAR/CDR/IPIF) are little-endian on the bus:
+     * the firmware accesses them exclusively through byte-swapping accessors
+     * (XPci_mReadReg/mWriteReg == FUN_0000010c/FUN_00000118).  Declaring the
+     * region little-endian makes the guest's swap + this region's assembly
+     * round-trip to the intended register value (CAR enable bit, CDR config
+     * data, etc.).  A big-endian region drops the CAR enable bit and breaks
+     * every firmware config cycle. */
+    .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = {
         .min_access_size = 4,
+        .max_access_size = 4,
+    },
+};
+
+/* -------------------------------------------------------------------------
+ * ISP1562 (dev B) BAR0 register block.
+ *
+ * Reads return 0 so the enumerator's post-match probe — read at BAR0+off+8,
+ * test (val>>8)&0xff > 0x40 — evaluates false and the reset/poll path is
+ * skipped.  Writes are discarded.  This is a discovery/enumeration stub, not a
+ * functional EHCI data path.
+ * ---------------------------------------------------------------------- */
+static uint64_t isp_bar0_read(void *opaque, hwaddr offset, unsigned size)
+{
+    return 0;
+}
+
+static void isp_bar0_write(void *opaque, hwaddr offset,
+                           uint64_t val, unsigned size)
+{
+}
+
+static const MemoryRegionOps isp_bar0_ops = {
+    .read       = isp_bar0_read,
+    .write      = isp_bar0_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
         .max_access_size = 4,
     },
 };
@@ -220,6 +356,8 @@ static void opb_pci_reset(DeviceState *dev)
 {
     XilinxOpbPciState *s = XILINX_OPB_PCI(dev);
     memset(s->regs, 0, sizeof(s->regs));
+    s->isp_a_cmd = 0;
+    s->isp_b_cmd = 0;
 }
 
 /* -------------------------------------------------------------------------
@@ -231,6 +369,14 @@ static void opb_pci_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->mmio, OBJECT(s), &opb_pci_ops, s,
                           TYPE_XILINX_OPB_PCI, 0x10000);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->mmio);
+
+    /* ISP1562 dev B BAR0 register block, mapped into PCI memory window 0.
+     * Overlap-priority 1 so it wins over the create_unimplemented_device
+     * "pci-mem0" catch-all that also covers 0xA0000000. */
+    memory_region_init_io(&s->isp_bar0, OBJECT(s), &isp_bar0_ops, s,
+                          "isp1562-bar0", ISP_BAR0_SIZE);
+    memory_region_add_subregion_overlap(get_system_memory(),
+                                        ISP_BAR0_BASE, &s->isp_bar0, 1);
 }
 
 /* -------------------------------------------------------------------------

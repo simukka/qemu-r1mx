@@ -890,9 +890,13 @@ static void r1mx_init(MachineState *machine)
     /* --- XPS PCI v1.02a host bridge (xlnx.opb-pci-host) -----------------
      * Confirmed base: 0xe1200000 (XPAR_PCI_0_BASEADDR / PCI_CFG_BASE).
      * Exposes IPIF interrupt registers + CAR/CDR PCI config cycle port.
-     * Bus is empty (all config reads return 0xFFFFFFFF = no device).
+     * Bus 0 is populated by the bridge itself (dev 0) plus two ISP1562 USB
+     * host-controller leaf devices (dev 1 = class 0x0C03A0, dev 2 = class
+     * 0x0C0320) which the cold-boot enumerator FUN_00367f54 scans for; without
+     * them the device count (0xE26978) stays 0 and the keystone allocator
+     * 0x5652D0 returns -7 (see boot_reconstruction_status.md, 2026-06-13).
      * XPci_SelfTest() has no hardware access and always returns XST_SUCCESS.
-     * SiI3512 SATA and ISP1562 USB stubs deferred to later phases. */
+     * SiI3512 SATA stub still deferred. */
     {
         DeviceState  *pci_dev = qdev_new("xlnx.opb-pci-host");
         SysBusDevice *pci_sbd = SYS_BUS_DEVICE(pci_dev);
