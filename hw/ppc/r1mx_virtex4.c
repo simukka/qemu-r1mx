@@ -705,6 +705,7 @@ static void block_sampler_init(void)
 #define VXWORKS_CANARY_2_ADDR  0x00E269A0u   /* expects 0x5A5AC3C3 */
 #define DISPATCH_BRANCH_ADDR   0x00371D5Cu   /* bne 0x371D78 -> b (force else-path) */
 #define DISPATCH_FNPTR_ADDR    0x00E293F4u   /* *0xE293F4: NULL -> skip stale call  */
+#define PCI_CFG_GATE_ADDR      0x00E0BDFCu   /* XPci config gate: must be -1 to register */
 
 /* Apply the boot-environment fixups directly to RAM.  Run from a VM-state-change
  * handler on the transition to RUNNING: this fires after the -device loader's
@@ -718,6 +719,14 @@ static void r1mx_apply_boot_env_fixups(void *opaque, bool running, RunState stat
     static const uint8_t canary2[4]       = { 0x5a, 0x5a, 0xc3, 0xc3 };
     static const uint8_t disp_force_else[4]= { 0x48, 0x00, 0x00, 0x1c }; /* b 0x371D78   */
     static const uint8_t disp_fnptr[4]    = { 0x00, 0x00, 0x00, 0x00 }; /* NULL -> skip  */
+    /* XPci config gate: hw_seq_init's FUN_0000019c registers the config mechanism
+     * (CAR/CDR) only if *0xE0BDFC == -1 first; cold .data holds garbage
+     * (0x943c5669) so the registration silently no-ops and every config cycle
+     * returns -1.  No code outside FUN_0000019c writes this slot, so seed it to
+     * -1 here (same class as the canary/dispatch seeds — pending the real
+     * pre-hw_seq_init initialiser).  Verified: with this, FUN_0000019c sets
+     * gate=0/mech=1/CAR=0xB260010C/CDR=0xB2600110.  (2026-06-15) */
+    static const uint8_t pci_cfg_gate[4]  = { 0xff, 0xff, 0xff, 0xff }; /* -1 -> register */
 
     uint8_t at84[4];
 
@@ -736,6 +745,7 @@ static void r1mx_apply_boot_env_fixups(void *opaque, bool running, RunState stat
     cpu_physical_memory_write(VXWORKS_CANARY_2_ADDR,  canary2, 4);
     cpu_physical_memory_write(DISPATCH_BRANCH_ADDR,   disp_force_else, 4);
     cpu_physical_memory_write(DISPATCH_FNPTR_ADDR,    disp_fnptr, 4);
+    cpu_physical_memory_write(PCI_CFG_GATE_ADDR,      pci_cfg_gate, 4);
 }
 
 /* ---------------------------------------------------------------------------
@@ -931,8 +941,12 @@ static void r1mx_init(MachineState *machine)
         sysbus_mmio_map(pci_sbd, 0, PCI_CFG_BASE);
     }
 
-    /* XPS IIC (I²C) */
-    create_unimplemented_device("xps-iic", I2C_BASE, I2C_SIZE);
+    /* NOTE: 0xB2600000 (formerly mapped here as "xps-iic") is actually the XPci
+     * CAR/CDR config-cycle port — the firmware drives PCI config cycles there
+     * (hw_seq_init -> FUN_0000019c registers CAR=0xB260010C/CDR=0xB2600110) and
+     * never uses 0xB260xxxx for I2C.  The bridge now aliases its register block
+     * at 0xB2600000 (see hw/pci-host/xilinx_opb_pci.c), so the old I2C stub here
+     * is removed to avoid overlap.  If a real XIic surfaces, map it elsewhere. */
 
     /* PCI memory windows */
     create_unimplemented_device("pci-mem0",  PCI_MEM_BASE,  PCI_MEM_SIZE);

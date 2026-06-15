@@ -170,11 +170,23 @@ OBJECT_DECLARE_SIMPLE_TYPE(XilinxOpbPciState, XILINX_OPB_PCI)
 struct XilinxOpbPciState {
     SysBusDevice  parent_obj;
     MemoryRegion  mmio;
+    MemoryRegion  cfg_alias;      /* same regs aliased at the CAR/CDR port base */
     MemoryRegion  isp_bar0;       /* ISP1562 dev B BAR0 register block */
     uint32_t      regs[R_MAX];
     uint16_t      isp_a_cmd;      /* shadow of dev A PCI command reg   */
     uint16_t      isp_b_cmd;      /* shadow of dev B PCI command reg   */
 };
+
+/* The firmware accesses this bridge through TWO windows (verified 2026-06-15 by
+ * tracing hw_seq_init -> FUN_0000019c, which registers CAR=0xB260010C/CDR=
+ * 0xB2600110, and the 9 IPIF reads at 0xe1200000 via the plain-load FUN_000000dc):
+ *   - IPIF / interrupt / control regs at the sysbus base (0xe1200000), and
+ *   - the CAR/CDR PCI config-cycle port at 0xB2600000 (offsets +0x10C/+0x110).
+ * Real config cycles go to 0xB2600000, NOT 0xe1200000, so we alias the same
+ * register block there.  (The machine previously mapped XIic at 0xB2600000, but
+ * the firmware never uses 0xB260xxxx for I2C — only the 2 CAR/CDR accesses exist.)
+ */
+#define XPCI_CFG_PORT_BASE  0xB2600000u
 
 /* -------------------------------------------------------------------------
  * Config cycle decode
@@ -315,7 +327,16 @@ static const MemoryRegionOps opb_pci_ops = {
      * data, etc.).  A big-endian region drops the CAR enable bit and breaks
      * every firmware config cycle. */
     .endianness = DEVICE_LITTLE_ENDIAN,
+    /* The firmware reads PCI config data at sub-dword granularity (e.g. a 16-bit
+     * vendor/device read at CDR+2 = offset 0x112).  Accept 1/2/4-byte accesses
+     * but always implement them as 4-byte (QEMU extracts the requested bytes),
+     * so opb_pci_config_read still sees a full dword and the CAR/CDR registers
+     * behave correctly. */
     .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+    .impl = {
         .min_access_size = 4,
         .max_access_size = 4,
     },
@@ -369,6 +390,15 @@ static void opb_pci_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->mmio, OBJECT(s), &opb_pci_ops, s,
                           TYPE_XILINX_OPB_PCI, 0x10000);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->mmio);
+
+    /* Alias the same register block at the firmware's CAR/CDR config-cycle port
+     * base (0xB2600000).  The firmware writes CAR at +0x10C and reads CDR at
+     * +0x110 here (little-endian, byte-reverse accessors); aliasing makes those
+     * cycles reach opb_pci_config_read/write and the ISP1562 leaves. */
+    memory_region_init_alias(&s->cfg_alias, OBJECT(s), "xpci-cfg-port",
+                             &s->mmio, 0, 0x10000);
+    memory_region_add_subregion(get_system_memory(), XPCI_CFG_PORT_BASE,
+                                &s->cfg_alias);
 
     /* ISP1562 dev B BAR0 register block, mapped into PCI memory window 0.
      * Overlap-priority 1 so it wins over the create_unimplemented_device
