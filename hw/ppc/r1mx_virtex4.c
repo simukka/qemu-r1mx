@@ -697,6 +697,44 @@ static void block_sampler_init(void)
  *       harvested/verified against live cam-working-01, 2026-06-14; see
  *       boot_reconstruction_status.md.)
  *
+ *   #6  usrRoot TRUE-ENTRY redirect (2026-06-17).  usrInit (main_boot_init,
+ *       0x36C350) calls kernelInit(rootRtn=0x37C440, ...).  0x37C440 is a
+ *       mid-function RESUME label (`b 0x37c290`) inside usrRoot (the function
+ *       starts at the prologue 0x37BF78), NOT a clean entry: it assumes r30 is
+ *       already 0xEA0000.  With the else-path forced (#4/#5) the root task
+ *       dispatches straight to TCB+0xC0 = 0x37C440 with r30 = 0, so the
+ *       dispatcher block at 0x37c290 (`lwz r9,-0x3c20(r30); stw r3,0x278(r9)`)
+ *       reads *0xFFFFC3E0 and writes through it, clobbering the PCI config-address
+ *       builder instruction at 0x274 (`or r3,r3,r5` 0x7c632b78 -> illegal) ->
+ *       SILENTLY breaks every PCI config read.  Fix: redirect rootRtn to usrRoot's
+ *       TRUE entry 0x37BF78 so its prologue runs and sets r30 = 0xEA0000 itself
+ *       (no register injection; maximally faithful).  Patch the immediate built at
+ *       0x36C414 `addi r3,r3,-0x3bc0` (0x37C440) -> `addi r3,r3,-0x4088` (0x37BF78);
+ *       the preceding `lis r3,0x38` (0x36C40C) is unchanged.  Companions, all
+ *       cold-.data garbage the bypassed early init would have set (same class as
+ *       the canary/gate seeds): *0xE2706C = 0 (usrRoot's per-call state flag, which
+ *       usrRoot only ever toggles 0<->1; cold garbage 0x005170c8 -> the true entry
+ *       would take the init-pass branch and return — seed 0 so it falls straight
+ *       through the main body in one pass and sets r30) and the deferred-write list
+ *       head/tail at 0xE9C5C0/0xE9C5C4 -> self (empty ring), required by the
+ *       prologue's deferred-write walker 0x37d87c.  VERIFIED (drive_enum.py /
+ *       lockstep): with these, the natural dispatch enters 0x37BF78, r30 is set by
+ *       the prologue, and 0x274 stays 0x7c632b78 (no corruption).  NB the free-run
+ *       natural boot then meets the broader init-bypass cascade (a clean 0x700 deep
+ *       in early usrRoot) — the documented irreducible wall; the faithful
+ *       device-init / PCI-enum path remains the harness-driven one (drive_enum.py),
+ *       now corruption-free.  See boot_reconstruction_status.md 2026-06-16/17.
+ *
+ *   #7  Allocator guard-zone seed (2026-06-17).  RED's memPartLib per-allocation
+ *       guard/red-zone size global *0xE295E4 is cold-.data garbage 0x00d8fad0
+ *       (~14 MB); nothing in the allocator init writes it (read-only config const
+ *       set by the bypassed early data init).  Left nonzero it makes addToPool
+ *       waste ~14 MB at the pool front and the carve overhead so large that the
+ *       FIRST malloc takes the no-split branch and empties the free tree (only one
+ *       malloc serviceable).  Seed 0 (guards off, the production default) so the
+ *       allocator services unlimited mallocs (e.g. the PCI enum's per-device
+ *       descriptors).  See boot_reconstruction_status.md 2026-06-17.
+ *
  * Run as a reset handler registered from a machine-init-done notifier, so it
  * executes AFTER the -device loader has populated RAM, on every reset.
  * --------------------------------------------------------------------------- */
@@ -706,6 +744,11 @@ static void block_sampler_init(void)
 #define DISPATCH_BRANCH_ADDR   0x00371D5Cu   /* bne 0x371D78 -> b (force else-path) */
 #define DISPATCH_FNPTR_ADDR    0x00E293F4u   /* *0xE293F4: NULL -> skip stale call  */
 #define PCI_CFG_GATE_ADDR      0x00E0BDFCu   /* XPci config gate: must be -1 to register */
+#define ROOTRTN_ADDI_ADDR      0x0036C414u   /* addi r3,r3,-0x3bc0 (0x37C440) -> -0x4088 */
+#define USRROOT_STATE_ADDR     0x00E2706Cu   /* usrRoot per-call state flag: garbage -> 0 */
+#define DEFER_LIST_HEAD_ADDR   0x00E9C5C0u   /* deferred-write list head -> self (empty)   */
+#define DEFER_LIST_TAIL_ADDR   0x00E9C5C4u   /* deferred-write list tail -> self (empty)   */
+#define ALLOC_GUARDZONE_ADDR   0x00E295E4u   /* memPartLib guard/red-zone size: garbage -> 0 */
 
 /* Apply the boot-environment fixups directly to RAM.  Run from a VM-state-change
  * handler on the transition to RUNNING: this fires after the -device loader's
@@ -727,8 +770,14 @@ static void r1mx_apply_boot_env_fixups(void *opaque, bool running, RunState stat
      * pre-hw_seq_init initialiser).  Verified: with this, FUN_0000019c sets
      * gate=0/mech=1/CAR=0xB260010C/CDR=0xB2600110.  (2026-06-15) */
     static const uint8_t pci_cfg_gate[4]  = { 0xff, 0xff, 0xff, 0xff }; /* -1 -> register */
+    /* #6 usrRoot true-entry redirect + companions (see header comment). */
+    static const uint8_t rootrtn_addi[4]  = { 0x38, 0x63, 0xbf, 0x78 }; /* addi r3,r3,-0x4088 */
+    static const uint8_t usrroot_state[4] = { 0x00, 0x00, 0x00, 0x00 }; /* state flag -> 0    */
+    static const uint8_t defer_self[4]    = { 0x00, 0xe9, 0xc5, 0xc0 }; /* list node -> &head  */
+    /* #7 allocator guard-zone -> 0 (guards off; repeated-malloc-capable). */
+    static const uint8_t alloc_guardzone[4] = { 0x00, 0x00, 0x00, 0x00 };
 
-    uint8_t at84[4];
+    uint8_t at84[4], at_addi[4];
 
     if (!running) {
         return;
@@ -746,6 +795,22 @@ static void r1mx_apply_boot_env_fixups(void *opaque, bool running, RunState stat
     cpu_physical_memory_write(DISPATCH_BRANCH_ADDR,   disp_force_else, 4);
     cpu_physical_memory_write(DISPATCH_FNPTR_ADDR,    disp_fnptr, 4);
     cpu_physical_memory_write(PCI_CFG_GATE_ADDR,      pci_cfg_gate, 4);
+
+    /* #6 Redirect the root routine to usrRoot's true entry 0x37BF78 (the prologue
+     * that sets r30), only if the original 0x37C440 immediate is present
+     * (`addi r3,r3,-0x3bc0` = 38 63 c4 40), and seed its state-flag/deferred-write
+     * companions so the prologue path runs in one pass without corrupting 0x274. */
+    cpu_physical_memory_read(ROOTRTN_ADDI_ADDR, at_addi, 4);
+    if (at_addi[0] == 0x38 && at_addi[1] == 0x63 &&
+        at_addi[2] == 0xc4 && at_addi[3] == 0x40) {
+        cpu_physical_memory_write(ROOTRTN_ADDI_ADDR,    rootrtn_addi, 4);
+    }
+    cpu_physical_memory_write(USRROOT_STATE_ADDR,   usrroot_state, 4);
+    cpu_physical_memory_write(DEFER_LIST_HEAD_ADDR, defer_self, 4);
+    cpu_physical_memory_write(DEFER_LIST_TAIL_ADDR, defer_self, 4);
+
+    /* #7 Allocator guard-zone -> 0 (repeated-malloc-capable). */
+    cpu_physical_memory_write(ALLOC_GUARDZONE_ADDR, alloc_guardzone, 4);
 }
 
 /* ---------------------------------------------------------------------------

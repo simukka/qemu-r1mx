@@ -133,6 +133,25 @@ static const uint32_t bridge_cfg[64] = {
  * a reset and poll.  We back BAR0 with a register block that reads as 0, so the
  * (>>8)&0xff test is 0 and the reset/poll path is skipped.
  *
+ * NB (2026-06-17): with the allocator now repeated-malloc-capable, the enum was
+ * driven all the way through loop 2.  It MATCHES dev 2, mallocs its 0x24
+ * descriptor, enables it, reads BAR0 — then calls the descriptor's first method
+ * (descriptor[0] = literal 0x377C24, via `bctrl` at 0x3681D4).  That target is a
+ * mid-function soft-float continuation with NON-STANDARD linkage (no stwu
+ * prologue; it restores lr from a caller-prepared 0(r1) slot), so under any forced
+ * /synthetic task frame it returns to the stale back-chain instead of back into
+ * loop 2 — the enum then stops with count = 1 and dev 2's descriptor allocated but
+ * un-incremented.  Consequently the EHCI BIOS->OS handoff (the (>>8)&0xff > 0x40
+ * branch, whose poll FUN_0036744C is a PCI-CONFIG read at the EECP offset — handled
+ * here, NOT an EHCI-MMIO access) is never reached in the drivable context.  So
+ * there is no EHCI register model to add: BAR0-reads-0 is sufficient, and the
+ * count-1-vs-2 difference is a task-frame-fidelity artifact (same class as the
+ * broader init-bypass cascade), not a device-model gap.  IF a future faithful-frame
+ * boot reaches the handoff, the device-model need would be a USBLEGSUP extended
+ * capability in dev 2's config at the EECP offset (clear BIOS-owned bit 16 when the
+ * OS sets owned bit 24); it is intentionally NOT added now since nothing exercises
+ * it.  See boot_reconstruction_status.md 2026-06-17.
+ *
  * Config dword layout matches the firmware read path (CDR returns the 32-bit
  * word; FUN_00000b3c does (cfg[0x08]>>8) == class).  VID/DID 0x04CC:0x1562.
  * ---------------------------------------------------------------------- */
