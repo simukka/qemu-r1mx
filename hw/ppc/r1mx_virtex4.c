@@ -57,6 +57,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/qdev-properties-system.h"
 #include "hw/misc/unimp.h"
+#include "hw/char/serial.h"
 #include "hw/loader.h"
 #include "exec/address-spaces.h"
 #include "sysemu/sysemu.h"
@@ -117,6 +118,8 @@
 #define IRQ_UARTLITE    0
 #define IRQ_ETHLITE     1
 #define IRQ_DMA         2
+#define IRQ_UART550_0   3   /* placeholder XIntc line for NS550 #0 (real assignment TBD) */
+#define IRQ_UART550_1   4   /* placeholder XIntc line for NS550 #1 */
 
 /* ---------------------------------------------------------------------------
  * NOR flash / boot ROM stub
@@ -987,6 +990,24 @@ static void r1mx_init(MachineState *machine)
      * UART550_SIZE must be > 0x1020 to avoid MCE on those accesses. */
     create_unimplemented_device("uart16550-0", UART550_0_BASE, UART550_SIZE);
     create_unimplemented_device("uart16550-1", UART550_1_BASE, UART550_SIZE);
+
+    /* Real XUartNs550 (16550) consoles. The Xilinx 16550 core sits at
+     * base + XUN_REG_OFFSET (0x1000) with 32-bit register spacing (regshift=2)
+     * and the 8-bit register in the LSB byte (big-endian) -- the driver hits
+     * base+0x1000 + reg*4 + 3. serial_mm computes reg = (offset >> regshift),
+     * so a serial-mm region based at base+0x1000 resolves those accesses
+     * ((reg*4+3) >> 2 == reg). VxWorks routes its console + shell to one of
+     * these NS550s (the XUartLite only carries boot-ROM diagnostics), so wiring
+     * them to chardevs surfaces the boot banner, boot line and shell prompt.
+     * Mapped at priority 0 over the -1000 unimplemented stubs above (no overlap
+     * abort: those were added with add_subregion_overlap). IRQ lines are
+     * placeholders -- correct for TX (console output); RX/shell input may need
+     * the real XIntc line once known. serial_hd(0) is the XUartLite; NS550s use
+     * serial_hd(1)/(2). */
+    serial_mm_init(sysmem, UART550_0_BASE + 0x1000, 2, intc_irqs[IRQ_UART550_0],
+                   115200 * 16, serial_hd(1), DEVICE_BIG_ENDIAN);
+    serial_mm_init(sysmem, UART550_1_BASE + 0x1000, 2, intc_irqs[IRQ_UART550_1],
+                   115200 * 16, serial_hd(2), DEVICE_BIG_ENDIAN);
 
     /* --- XPS Central DMA (xlnx.opb-dma-channel) -------------------------
      * Confirmed base: 0x64010000 (XPAR_DMACHANNEL_0_BASEADDR).
