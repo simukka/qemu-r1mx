@@ -842,9 +842,15 @@ static void r1mx_init(MachineState *machine)
     env->spr[SPR_PVR]                  = 0x20011000;
 
     /* PPC405 init_excp_4xx_softmmu sets hreset_vector = 0xFFFFFFFCUL (boot ROM).
-     * The RED ONE MX firmware is loaded at physical 0x0, not at the PPC boot ROM.
-     * Override hreset_vector so every cpu_reset() lands at 0x0 instead. */
-    env->hreset_vector = 0x00000000UL;
+     * software.bin is a position-dependent VxWorks RAM image LINKED FOR BASE 0x10000
+     * (the -device loader places it at 0x10000; romInit is at file offset 0 ->
+     * runtime 0x10000).  Override hreset_vector so every cpu_reset() lands there.
+     * This load base is what makes the firmware's own .data initialisers AND its
+     * absolute code pointers resolve correctly; at base 0x0 every stored pointer and
+     * global was 0x10000 too high -- the long "garbage fn-ptr / circular bootstrap"
+     * saga was entirely this load-base error.  See boot_reconstruction_status.md
+     * 2026-06-20. */
+    env->hreset_vector = 0x00010000UL;
 
     /* PPC405 needs the 40x timer helpers (PIT/FIT/WDT).
      * Do NOT use ppc_booke_timers_init here — that is for PPC440 (Book-E).
@@ -857,9 +863,15 @@ static void r1mx_init(MachineState *machine)
     /* CPU + RAM activity sampler — fires every 5 ms virtual time */
     cpu_sampler_init(&g_cpu_sampler, cpu);
 
-    /* Boot-environment fixups (boot SP relocate + VxWorks canaries) applied after
-     * the -device loader populates RAM, before the vCPU runs.  See above. */
-    qemu_add_vm_change_state_handler(r1mx_apply_boot_env_fixups, NULL);
+    /* Boot-environment fixups DISABLED 2026-06-20.  Every one was a symptom-patch
+     * for the wrong load base (0x0 instead of 0x10000): the canaries, PCI gate,
+     * guard-zone, dispatch-fnptr and usrRoot-state seeds are just the firmware's own
+     * .data initialisers, now loaded correctly at base 0x10000; the code patches
+     * (#4/#5 @0x371D5C, #6 @0x36C414) would corrupt the wrong instructions at the
+     * shifted base.  Boot native.  (Function kept above for reference / git history.)
+     * See boot_reconstruction_status.md 2026-06-20. */
+    /* qemu_add_vm_change_state_handler(r1mx_apply_boot_env_fixups, NULL); */
+    (void)r1mx_apply_boot_env_fixups;  /* retained for reference; silence unused */
 
     /* Connect the PPC405 external interrupt to the XIntc below */
     cpu_irq = qdev_get_gpio_in(DEVICE(cpu), PPC40x_INPUT_INT);
