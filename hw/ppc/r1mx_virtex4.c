@@ -155,6 +155,51 @@ static const MemoryRegionOps nor_flash_ops = {
 };
 
 /* ---------------------------------------------------------------------------
+ * ATA/SATA host adapter — minimal "empty bay" model (PROTOTYPE)
+ *
+ * The VxWorks ataDrv polls the IDE task-file registers at the *bare* legacy
+ * ports 0x1F0-0x1F7 (command block) and 0x3F6 (control block / AltStatus) --
+ * confirmed un-rebased in the live image.  With no model these land on the low
+ * exception-vector DRAM page and return code bytes; AltStatus@0x3F6 happens to
+ * read 0x08 (BSY clear), which fools the reset/probe (FUN_0001f8f0) into
+ * thinking a drive is present and ready -- it then issues a command and hangs
+ * forever in ataPiWait (FUN_000206bc), which has no timeout.
+ *
+ * A real IDE/SATA channel with no media floats high: every task-file read is
+ * 0xFF, so Status/AltStatus read with BSY (0x80) set.  Returning 0xFF here lets
+ * the firmware's own tick-bounded probe time out (now that the PIT runs) and
+ * conclude "no drive", so boot continues -- the faithful empty-bay path that
+ * the hot-plug monitor task tSataMon expects.
+ *
+ * PROTOTYPE: overlaid at the literal legacy CPU-physical addresses.  Whether
+ * the real board decodes those addresses directly (a) or rebases the table to a
+ * PCI-I/O window via the SATA BAR (b) is pending the live-HW read
+ * (plans/ata_live_hw_read.md).  Once known, this becomes either a low-address
+ * overlay or a proper PCI SATA function.  See boot_reconstruction_status.md.
+ * --------------------------------------------------------------------------- */
+static uint64_t ata_empty_read(void *opaque, hwaddr offset, unsigned size)
+{
+    /* Floating IDE bus with no device: all bits high (BSY set on status regs). */
+    return 0xFFFFFFFFFFFFFFFFULL >> (64 - size * 8);
+}
+
+static void ata_empty_write(void *opaque, hwaddr offset,
+                            uint64_t val, unsigned size)
+{
+    /* No device to latch register writes (incl. SRST to DevControl). */
+}
+
+static const MemoryRegionOps ata_empty_ops = {
+    .read       = ata_empty_read,
+    .write      = ata_empty_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
+/* ---------------------------------------------------------------------------
  * FPGA fabric TCP bridge (port 17186)
  *
  * Every write to an FPGA peripheral (0xe0000000-0xe3ffffff) is forwarded to
@@ -1049,6 +1094,25 @@ static void r1mx_init(MachineState *machine)
         memory_region_add_subregion(sysmem, BOOT_ROM_BASE, rom);
         install_spy_mr(sysmem, rom, BOOT_ROM_BASE, BOOT_ROM_SIZE,
                         R1MX_DEV_ROM, "boot-rom");
+    }
+
+    /* --- ATA/SATA host adapter — empty-bay model (PROTOTYPE) -------------
+     * Overlay the IDE task-file registers at the bare legacy ports the firmware
+     * polls: command block 0x1F0-0x1F7 (Data..Status) and control block 0x3F6
+     * (DevControl/AltStatus).  High priority so these byte ranges shadow the RAM
+     * underneath (the low exception-vector page); the rest of the page stays RAM.
+     * Reads return 0xFF (floating bus = no media) so the firmware's tick-bounded
+     * reset/probe times out and reports "no drive", letting boot proceed past
+     * ataPiWait.  See ata_empty_ops above and plans/ata_live_hw_read.md. */
+    {
+        MemoryRegion *ata_cmd  = g_new(MemoryRegion, 1);
+        MemoryRegion *ata_ctrl = g_new(MemoryRegion, 1);
+        memory_region_init_io(ata_cmd, NULL, &ata_empty_ops, NULL,
+                              "r1mx.ata-cmd", 0x8);   /* 0x1F0-0x1F7 */
+        memory_region_init_io(ata_ctrl, NULL, &ata_empty_ops, NULL,
+                              "r1mx.ata-ctrl", 0x2);  /* 0x3F6-0x3F7 */
+        memory_region_add_subregion_overlap(sysmem, 0x1F0, ata_cmd,  1000);
+        memory_region_add_subregion_overlap(sysmem, 0x3F6, ata_ctrl, 1000);
     }
 
     /* --- FPGA fabric catch-all (64 MB at 0xe0000000-0xe3ffffff) ----------
