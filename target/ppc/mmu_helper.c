@@ -826,7 +826,15 @@ void helper_4xx_tlbwe_lo(CPUPPCState *env, target_ulong entry,
     tlb = &env->tlb.tlbe[entry];
     tlb->attr = val & PPC4XX_TLBLO_ATTR_MASK;
     tlb->RPN = val & PPC4XX_TLBLO_RPN_MASK;
-    tlb->prot = PAGE_READ;
+    /*
+     * The valid bit lives in TLBHI (the tag word); writing TLBLO (the data
+     * word) must not disturb it.  Preserve PAGE_VALID instead of rebuilding
+     * prot from scratch, so a TLBHI-then-TLBLO write order leaves the entry
+     * valid.  (The VxWorks 6.4 PPC405 DTLB-miss handler writes tlbwe-hi then
+     * tlbwe-lo; clobbering the valid bit here makes the freshly-installed entry
+     * fail to match -> the faulting access re-faults forever.)
+     */
+    tlb->prot = (tlb->prot & PAGE_VALID) | PAGE_READ;
     if (val & PPC4XX_TLBLO_EX) {
         tlb->prot |= PAGE_EXEC;
     }
