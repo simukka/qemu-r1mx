@@ -31,6 +31,21 @@
 
 #define D(x)
 
+/* r1mx temporary instrumentation: trace all XIntc register/pin activity.
+ * Set to 1 to re-enable (writes via qemu_log; needs any -d category + -D file).
+ * 2026-06-21: proved the firmware's XIntc instance @0xfcaa14 is never
+ * CfgInitialize'd (fill-pattern struct), so MER/IER are never programmed at the
+ * real base 0xe0800000 -> no external (vec 0x500) interrupts -> no shell/telnet. */
+#define R1MX_INTC_TRACE 1
+#if R1MX_INTC_TRACE
+#include "qemu/log.h"
+static const char *r1mx_regname(int a)
+{
+    static const char *n[] = {"ISR","IPR","IER","IAR","SIE","CIE","IVR","MER"};
+    return (a >= 0 && a < 8) ? n[a] : "?";
+}
+#endif
+
 #define R_ISR       0
 #define R_IPR       1
 #define R_IER       2
@@ -84,6 +99,14 @@ static void update_irq(XpsIntc *p)
         i = ~0;
 
     p->regs[R_IVR] = i;
+#if R1MX_INTC_TRACE
+    {
+        int out = (p->regs[R_MER] & 1) && p->regs[R_IPR];
+        qemu_log("INTC update: MER=%x IER=%08x ISR=%08x IPR=%08x pin=%08x -> CPU_IRQ=%d\n",
+                 p->regs[R_MER], p->regs[R_IER], p->regs[R_ISR],
+                 p->regs[R_IPR], p->irq_pin_state, out);
+    }
+#endif
     qemu_set_irq(p->parent_irq, (p->regs[R_MER] & 1) && p->regs[R_IPR]);
 }
 
@@ -102,6 +125,9 @@ static uint64_t pic_read(void *opaque, hwaddr addr, unsigned int size)
 
     }
     D(printf("%s %x=%x\n", __func__, addr * 4, r));
+#if R1MX_INTC_TRACE
+    qemu_log("INTC read:  %s (reg %d) => %08x\n", r1mx_regname((int)addr), (int)addr, r);
+#endif
     return r;
 }
 
@@ -113,7 +139,10 @@ static void pic_write(void *opaque, hwaddr addr,
 
     addr >>= 2;
     D(qemu_log("%s addr=%x val=%x\n", __func__, addr * 4, value));
-    switch (addr) 
+#if R1MX_INTC_TRACE
+    qemu_log("INTC write: %s (reg %d) <= %08x\n", r1mx_regname(addr), (int)addr, value);
+#endif
+    switch (addr)
     {
         case R_IAR:
             p->regs[R_ISR] &= ~value; /* ACK.  */
@@ -154,6 +183,11 @@ static void irq_handler(void *opaque, int irq, int level)
 {
     XpsIntc *p = opaque;
 
+#if R1MX_INTC_TRACE
+    if (((p->irq_pin_state >> irq) & 1) != (level & 1)) {
+        qemu_log("INTC pin %d -> %d\n", irq, level & 1);
+    }
+#endif
     /* edge triggered interrupt */
     if (p->c_kind_of_intr & (1 << irq) && p->regs[R_MER] & 2) {
         p->regs[R_ISR] |= (level << irq);

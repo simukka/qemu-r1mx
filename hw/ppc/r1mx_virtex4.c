@@ -80,7 +80,10 @@
 #define UARTLITE_BASE   0xe0600000u  /* XPS UARTLite  — 115200 8N1, TX FIFO +4 */
 #define UART550_0_BASE  0xe0640000u  /* XPS UART16550 #1 — not modelled        */
 #define UART550_1_BASE  0xe0650000u  /* XPS UART16550 #2 — not modelled        */
-#define INTC_BASE       0xe0800000u  /* XPS Interrupt Controller               */
+#define INTC_BASE       0xe1200000u  /* XPS Interrupt Controller (corrected 2026-06-21:
+                                      * firmware XIntc_LookupConfig cfg base = 0xe1200000,
+                                      * not 0xe0800000 — xparameters.h was regenerated at
+                                      * the wrong reloc and crossed XIntc/XIic/XPci) */
 #define ERRCTRS_BASE    0xe0be0000u  /* RED custom error-counter IP            */
 #define HIST0_BASE      0xe00a0000u  /* RED histogram IP 0                     */
 #define HIST1_BASE      0xe0080000u  /* RED histogram IP 1                     */
@@ -88,8 +91,10 @@
 #define HIST3_BASE      0xe0120000u  /* RED histogram IP 3                     */
 #define HIST4_BASE      0xe0200000u  /* RED histogram IP 4                     */
 #define ETHLITE_BASE    0xe1020000u  /* XPS EthernetLite — WDB endpoint        */
-#define PCI_CFG_BASE    0xe1200000u  /* XPS PCI v3 config registers            */
-#define I2C_BASE        0xb2600000u  /* XPS IIC (I²C)                          */
+#define PCI_CFG_BASE    0xb2600000u  /* XPS PCI v3 (corrected: XPci_LookupConfig base
+                                      * = 0xb2600000; CAR/CDR at +0x10C/+0x110)        */
+#define I2C_BASE        0xe0800000u  /* XPS IIC (I²C) (corrected: XIic_LookupConfig
+                                      * base = 0xe0800000, was wrongly the XIntc spot)  */
 #define PCI_MEM_BASE    0xa0000000u  /* PCI memory window (64 MB)              */
 #define PCI_MEM2_BASE   0x80000000u  /* PCI memory window 2 (512 MB)           */
 #define NOR_FLASH_BASE  0xf0000000u  /* NOR flash 128 MB                       */
@@ -109,17 +114,22 @@
 #define NOR_FLASH_SIZE  (128 * MiB)
 #define BOOT_ROM_SIZE   (64  * KiB)
 
-/* XIntc drives 32 interrupt lines; connect peripherals as follows:
- *   irq[0]  — XUartLite
- *   irq[1]  — XEmacLite
- *   irq[2]  — XPS Central DMA (line TBD from real hardware; 2 is a placeholder)
- * All others are left unconnected (silent).
+/* XIntc line assignments — CORRECTED 2026-06-21 from the firmware's live XIntc
+ * HandlerTable (read at runtime; the prior 0/1/2/3/4 values were placeholders from
+ * the mis-regenerated xparameters.h).  Confirmed device-per-line:
+ *   line 0  — PCI host bridge (pciInt)
+ *   line 4  — XUartNs550 (#0)
+ *   line 22 — XEmacLite
+ *   line 24 — XUartLite (console; interrupt-driven, enabled in IER)
+ *   line 26 — XUartNs550 (#1)
+ * Firmware-enabled IER bits at idle: 0, 4, 24, 26 (EmacLite line 22 enabled later).
  */
-#define IRQ_UARTLITE    0
-#define IRQ_ETHLITE     1
-#define IRQ_DMA         2
-#define IRQ_UART550_0   3   /* placeholder XIntc line for NS550 #0 (real assignment TBD) */
-#define IRQ_UART550_1   4   /* placeholder XIntc line for NS550 #1 */
+#define IRQ_PCI         0
+#define IRQ_UART550_0   4
+#define IRQ_ETHLITE     22
+#define IRQ_UARTLITE    24
+#define IRQ_UART550_1   26
+#define IRQ_DMA         2   /* not in firmware table; kept as placeholder, harmless */
 
 /* ---------------------------------------------------------------------------
  * NOR flash / boot ROM stub
@@ -939,7 +949,7 @@ static void r1mx_init(MachineState *machine)
     qdev_prop_set_uint32(intc_dev, "kind-of-intr", 0);
     intc_sbd = SYS_BUS_DEVICE(intc_dev);
     sysbus_realize_and_unref(intc_sbd, &error_fatal);
-    sysbus_mmio_map(intc_sbd, 0, INTC_BASE);
+    sysbus_mmio_map(intc_sbd, 0, INTC_BASE);   /* now 0xe1200000 (corrected) */
     sysbus_connect_irq(intc_sbd, 0, cpu_irq);
 
     /* Collect XIntc output lines so peripherals can trigger interrupts. */
@@ -957,6 +967,9 @@ static void r1mx_init(MachineState *machine)
         }
         sysbus_realize_and_unref(uart_sbd, &error_fatal);
         sysbus_mmio_map(uart_sbd, 0, UARTLITE_BASE);
+        /* UartLite is on XIntc line 24 (confirmed from the firmware HandlerTable:
+         * line 24 = XUartLite_InterruptHandler, enabled in IER).  The old line-0
+         * placeholder collided with PCI (pciInt) and stormed. */
         sysbus_connect_irq(uart_sbd, 0, intc_irqs[IRQ_UARTLITE]);
         /* Spy region intercepts all UARTLite accesses for the activity monitor.
          * UARTLite register space is 16 bytes (4 regs × 4 bytes). */
@@ -1081,15 +1094,18 @@ static void r1mx_init(MachineState *machine)
         DeviceState  *pci_dev = qdev_new("xlnx.opb-pci-host");
         SysBusDevice *pci_sbd = SYS_BUS_DEVICE(pci_dev);
         sysbus_realize_and_unref(pci_sbd, &error_fatal);
-        sysbus_mmio_map(pci_sbd, 0, PCI_CFG_BASE);
+        /* Do NOT map the main mmio at 0xe1200000 — that address is the XIntc
+         * (corrected 2026-06-21).  The real XPci base is 0xb2600000, which the
+         * model already covers via its internal cfg_alias (mapped in realize).
+         * CAR/CDR at 0xb260010C/0x110 resolve through that alias. */
     }
 
-    /* NOTE: 0xB2600000 (formerly mapped here as "xps-iic") is actually the XPci
-     * CAR/CDR config-cycle port — the firmware drives PCI config cycles there
-     * (hw_seq_init -> FUN_0000019c registers CAR=0xB260010C/CDR=0xB2600110) and
-     * never uses 0xB260xxxx for I2C.  The bridge now aliases its register block
-     * at 0xB2600000 (see hw/pci-host/xilinx_opb_pci.c), so the old I2C stub here
-     * is removed to avoid overlap.  If a real XIic surfaces, map it elsewhere. */
+    /* NOTE: 0xB2600000 is the XPci CAR/CDR config-cycle port (handled by the
+     * xlnx.opb-pci-host cfg_alias above), NOT I2C.  The real XIic (I²C) base is
+     * 0xe0800000 (corrected 2026-06-21 from XIic_LookupConfig; that address was
+     * previously mis-assigned to the XIntc).  Stub it so the firmware's IIC
+     * accesses (sensor/EEPROM/temp) land on a defined region instead of the XIntc. */
+    create_unimplemented_device("xps-iic", I2C_BASE, I2C_SIZE);
 
     /* PCI memory windows */
     create_unimplemented_device("pci-mem0",  PCI_MEM_BASE,  PCI_MEM_SIZE);

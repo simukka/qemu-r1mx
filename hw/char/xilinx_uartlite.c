@@ -72,10 +72,20 @@ static void uart_update_irq(XilinxUARTLite *s)
 {
     unsigned int irq;
 
-    if (s->rx_fifo_len)
+    /* STATUS bit 4 ("Intr Enabled") simply reflects the control-register
+     * interrupt-enable bit on real XUartLite hardware; it is NOT an
+     * interrupt-pending flag. */
+    if (s->regs[R_CTRL] & CONTROL_IE)
         s->regs[R_STATUS] |= STATUS_IE;
+    else
+        s->regs[R_STATUS] &= ~STATUS_IE;
 
-    irq = (s->regs[R_STATUS] & STATUS_IE) && (s->regs[R_CTRL] & CONTROL_IE);
+    /* Level-triggered receive interrupt: asserted while the RX FIFO holds
+     * data, cleared automatically once the driver drains it by reading RX.
+     * The transmit-complete interrupt is delivered as a one-shot pulse from
+     * uart_write (the TX FIFO drains instantly in this model), so it does not
+     * participate in this level. */
+    irq = (s->rx_fifo_len != 0) && (s->regs[R_CTRL] & CONTROL_IE);
     qemu_set_irq(s->irq, irq);
 }
 
@@ -152,8 +162,14 @@ uart_write(void *opaque, hwaddr addr,
             qemu_chr_fe_write_all(&s->chr, &ch, 1);
             s->regs[addr] = value;
 
-            /* hax.  */
-            s->regs[R_STATUS] |= STATUS_IE;
+            /* The TX FIFO drains instantly here, so the transmit-complete
+             * condition is an edge, not a level.  Deliver it as a single
+             * pulse so the interrupt-driven TX path gets exactly one "send
+             * next char" interrupt instead of latching the line high forever
+             * (the old "hax" set STATUS_IE permanently -> XIntc storm). */
+            if (s->regs[R_CTRL] & CONTROL_IE) {
+                qemu_irq_pulse(s->irq);
+            }
             break;
 
         default:
