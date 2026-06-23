@@ -39,6 +39,8 @@ config PPC405
     select PFLASH_CFI02
     select PPC4XX
     select SERIAL
+    select I2C
+    select DS1338   # r1mx UI-board DS1339A RTC (DS1338-compatible timekeeping)
 
 config PPC440
     bool

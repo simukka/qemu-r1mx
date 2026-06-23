@@ -2,6 +2,9 @@ system_ss.add(when: 'CONFIG_GPIO_KEY', if_true: files('gpio_key.c'))
 system_ss.add(when: 'CONFIG_GPIO_MPC8XXX', if_true: files('mpc8xxx.c'))
 system_ss.add(when: 'CONFIG_GPIO_PWR', if_true: files('gpio_pwr.c'))
 system_ss.add(when: 'CONFIG_MAX7310', if_true: files('max7310.c'))
+# PCA9698 40-bit I2C GPIO expander (RED ONE MX UI board status LCD / buttons).
+# Gated on CONFIG_PPC405 to match the r1mx-virtex4 machine and the ad9889 model.
+system_ss.add(when: 'CONFIG_PPC405', if_true: files('pca9698.c'))
 system_ss.add(when: 'CONFIG_PL061', if_true: files('pl061.c'))
 system_ss.add(when: 'CONFIG_ZAURUS', if_true: files('zaurus.c'))
 

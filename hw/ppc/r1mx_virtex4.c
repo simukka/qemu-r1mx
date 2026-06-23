@@ -67,6 +67,7 @@
 #include "qemu/main-loop.h"
 #include "qemu/timer.h"
 #include "hw/ppc/r1mx_activity.h"
+#include "hw/i2c/i2c.h"
 #include "sysemu/block-backend.h"
 #include "block/accounting.h"
 #include <sys/socket.h>
@@ -129,6 +130,8 @@
 #define IRQ_ETHLITE     22
 #define IRQ_UARTLITE    24
 #define IRQ_UART550_1   26
+#define IRQ_IIC         23  /* XPS IIC — from live XIntc HandlerTable (ref @line 23
+                             * is the XIic instance, BaseAddress 0xe0800000) */
 #define IRQ_DMA         2   /* not in firmware table; kept as placeholder, harmless */
 
 /* ---------------------------------------------------------------------------
@@ -1100,12 +1103,57 @@ static void r1mx_init(MachineState *machine)
          * CAR/CDR at 0xb260010C/0x110 resolve through that alias. */
     }
 
-    /* NOTE: 0xB2600000 is the XPci CAR/CDR config-cycle port (handled by the
-     * xlnx.opb-pci-host cfg_alias above), NOT I2C.  The real XIic (I²C) base is
-     * 0xe0800000 (corrected 2026-06-21 from XIic_LookupConfig; that address was
-     * previously mis-assigned to the XIntc).  Stub it so the firmware's IIC
-     * accesses (sensor/EEPROM/temp) land on a defined region instead of the XIntc. */
-    create_unimplemented_device("xps-iic", I2C_BASE, I2C_SIZE);
+    /* XPS IIC (I²C) controller at 0xe0800000 (corrected 2026-06-21 from
+     * XIic_LookupConfig; that address was previously mis-assigned to the XIntc).
+     * A real master model (xlnx.xps-iic) is required because the firmware's
+     * HDMI driver polls the AD9889 transmitters over this bus from inside its
+     * ISR; with the bus unmodelled those status reads NAK forever
+     * (ad9889_interrupt_handler "Failed to read AD9889 status registers"). */
+    {
+        DeviceState  *iic = qdev_new("xlnx.xps-iic");
+        SysBusDevice *iic_sbd = SYS_BUS_DEVICE(iic);
+        I2CBus       *iic_bus;
+
+        sysbus_realize_and_unref(iic_sbd, &error_fatal);
+        sysbus_mmio_map(iic_sbd, 0, I2C_BASE);
+        /* The firmware drives this bus INTERRUPT-DRIVEN (iic_v1_13_b
+         * XIic_MasterSend/MasterRecv): it starts a transfer then blocks waiting
+         * for the XIic completion interrupt, times out (~1 s) and soft-resets the
+         * controller if it never arrives.  The IIC IRQ is XIntc line 23 — read
+         * live from the XIntc HandlerTable, whose line-23 CallBackRef is the XIic
+         * instance (BaseAddress 0xe0800000 at +0x58).  Without this wire the
+         * AD9889 register reads (and any read-back) loop on timeout forever. */
+        sysbus_connect_irq(iic_sbd, 0, intc_irqs[IRQ_IIC]);
+
+        iic_bus = I2C_BUS(qdev_get_child_bus(iic, "i2c"));
+
+        /* AD9889B HDMI transmitters (/hdmi/evf,/lcd,/mhd).  Datasheet Rev.0 p.8:
+         * the 2-wire programming address is 0x72 (A0 low) or 0x7A (A0 high),
+         * i.e. 7-bit 0x39 or 0x3D.  A single AD9889 can only strap to one of
+         * these two, so the three on-board parts must sit on separate buses or
+         * behind an I²C mux; the exact per-output topology needs a boot I²C
+         * trace to pin down (unmatched addresses are logged by the controller).
+         * Populate both strap addresses so the primary path ACKs. */
+        i2c_slave_create_simple(iic_bus, "ad9889", 0x39);
+        i2c_slave_create_simple(iic_bus, "ad9889", 0x3d);
+
+        /* UI board (ui_board BOM): NXP PCA9698 40-bit GPIO expander at 7-bit
+         * 0x20.  It bit-bangs the body status LCD and reads the four front
+         * buttons.  The Sundance "Initializing the status display..." step
+         * writes to it; without an ACK the status-display init spins on
+         * XIic_Send (no "Error initializing the status display" is printed —
+         * it just hangs).  This is one of the three /i2cgpio/{0,1,2} nodes the
+         * firmware enumerates; the other two addresses are added as they are
+         * observed being accessed. */
+        i2c_slave_create_simple(iic_bus, "pca9698", 0x20);
+
+        /* UI board: DS1339A I2C real-time clock at 7-bit 0x68.  Its timekeeping
+         * registers (0x00-0x06) are DS1338-compatible, so the in-tree ds1338
+         * model is a functional stand-in.  DS1339-specific control/status/alarm
+         * registers (0x0E-0x10) are not exercised by the boot-time RTC read; if
+         * a later boot stage depends on them, replace this with a ds1339 model. */
+        i2c_slave_create_simple(iic_bus, "ds1338", 0x68);
+    }
 
     /* PCI memory windows */
     create_unimplemented_device("pci-mem0",  PCI_MEM_BASE,  PCI_MEM_SIZE);

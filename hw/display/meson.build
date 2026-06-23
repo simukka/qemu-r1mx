@@ -1,6 +1,7 @@
 hw_display_modules = {}
 
 system_ss.add(when: 'CONFIG_DDC', if_true: files('i2c-ddc.c'))
+system_ss.add(when: 'CONFIG_PPC405', if_true: files('ad9889.c'))
 system_ss.add(when: 'CONFIG_EDID', if_true: files('edid-generate.c', 'edid-region.c'))
 
 system_ss.add(when: 'CONFIG_FW_CFG_DMA', if_true: files('ramfb.c'))
