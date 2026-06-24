@@ -36,6 +36,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/main-loop.h"
 #include "hw/sysbus.h"
 #include "hw/irq.h"
 #include "hw/i2c/i2c.h"
@@ -144,6 +145,18 @@ struct XlnxXpsIicState {
      * Hold the STOP so that last byte is actually transmitted, then close the
      * transfer and raise BNB so the driver's bus-not-busy completion runs. */
     bool     stop_pending;
+
+    /* Deferred interrupt edges: on real silicon a TX FIFO byte takes time to
+     * shift onto the wire (TX_EMPTY asserts after the drain), and an Rx byte
+     * takes time to clock in (RX_FULL asserts after it arrives).  The
+     * interrupt-driven driver feeds/drains the FIFO one byte per ISR and then
+     * acknowledges the edge that woke it (XIic_mClearIisr); if we asserted the
+     * NEXT edge *synchronously* inside that same ISR's DTR/DRR access, the
+     * acknowledge would swallow it and the multi-byte transfer would stall and
+     * time out (~1 s).  So defer TX_EMPTY/RX_FULL to a bottom-half that runs
+     * after the guest's ISR returns, modelling the FIFO shift latency. */
+    QEMUBH  *bh;
+    uint32_t deferred_iisr;
 };
 
 #define XIIC_RX_FIFO_DEPTH 16
@@ -152,6 +165,28 @@ static void xlnx_iic_update_irq(XlnxXpsIicState *s)
 {
     bool level = (s->dgier & DGIER_GIE) && (s->iisr & s->iier);
     qemu_set_irq(s->irq, level);
+}
+
+/* Bottom-half: a TX-drain / Rx-fill edge has "completed" on the wire — assert
+ * the deferred IISR bit(s) now, after the guest's current ISR/MMIO returned. */
+static void xlnx_iic_irq_bh(void *opaque)
+{
+    XlnxXpsIicState *s = opaque;
+
+    s->iisr |= s->deferred_iisr;
+    s->deferred_iisr = 0;
+    xlnx_iic_update_irq(s);
+}
+
+/* Defer asserting an IISR edge (TX_EMPTY/RX_FULL): clear it now (the FIFO
+ * momentarily holds/lacks the byte) and schedule the BH to re-assert it after
+ * the guest ISR that is feeding/draining the FIFO returns — so the ISR's own
+ * XIic_mClearIisr cannot swallow the next byte's completion edge. */
+static void xlnx_iic_defer_int(XlnxXpsIicState *s, uint32_t bit)
+{
+    s->iisr &= ~bit;
+    s->deferred_iisr |= bit;
+    qemu_bh_schedule(s->bh);
 }
 
 static uint8_t xlnx_iic_status(XlnxXpsIicState *s)
@@ -196,9 +231,12 @@ static void xlnx_iic_rx_refill(XlnxXpsIicState *s)
         s->rx_fifo[s->rx_count++] = s->nak ? 0xff : i2c_recv(s->bus);
     }
     if (s->rx_count > 0) {
-        s->iisr |= INT_RX_FULL;
+        /* Defer RX_FULL: the byte clocks in after the ISR that drained the
+         * previous one returns, so its acknowledge can't swallow this edge. */
+        xlnx_iic_defer_int(s, INT_RX_FULL);
+    } else {
+        xlnx_iic_update_irq(s);
     }
-    xlnx_iic_update_irq(s);
 }
 
 static void xlnx_iic_stop(XlnxXpsIicState *s)
@@ -391,10 +429,15 @@ static void xlnx_iic_write_dtr(XlnxXpsIicState *s, uint64_t val, unsigned size)
                 s->tx_fifo[s->tx_count++] = byte;
             }
         } else if (!s->dir_read) {
+            /* A data byte written to the FIFO mid-transfer (the interrupt-driven
+             * ISR feeding the next byte).  Deliver it, but defer TX_EMPTY to the
+             * drain BH: the ISR clears TX_EMPTY right after this write, so a
+             * synchronous assertion would be swallowed and the repeated-start
+             * completion (which waits on the *next* TX_EMPTY) would never fire. */
             if (i2c_send(s->bus, byte)) {
                 s->iisr |= INT_TX_ERROR;
             }
-            s->iisr |= INT_TX_EMPTY;
+            xlnx_iic_defer_int(s, INT_TX_EMPTY);
             xlnx_iic_update_irq(s);
         }
     }
@@ -446,6 +489,10 @@ static void xlnx_iic_reset_state(XlnxXpsIicState *s)
     if (s->active) {
         i2c_end_transfer(s->bus);
     }
+    if (s->bh) {
+        qemu_bh_cancel(s->bh);
+    }
+    s->deferred_iisr = 0;
     s->cr = s->adr = s->rfd = s->gpo = 0;
     s->iisr = s->iier = s->dgier = 0;
     s->active = s->dir_read = s->dyn_mode = s->nak = s->have_rx = false;
@@ -507,10 +554,10 @@ static void xlnx_iic_write(void *opaque, hwaddr offset, uint64_t val,
     case R_DGIER:  s->dgier = val; xlnx_iic_update_irq(s); break;
     case R_IISR:   s->iisr &= ~(uint32_t)val; xlnx_iic_update_irq(s); break;
     case R_IIER:   s->iier = val; xlnx_iic_update_irq(s); break;
-                   xlnx_iic_write_cr(s, val & 0xff); break;
-                   xlnx_iic_write_dtr(s, val, size); break;
+    case R_CR:     xlnx_iic_write_cr(s, val & 0xff); break;
+    case R_DTR:    xlnx_iic_write_dtr(s, val, size); break;
     case R_ADR:    s->adr = val & 0xff; break;
-                   s->rfd = val & 0xff; break;
+    case R_RFD:    s->rfd = val & 0xff; break;
     case R_GPO:    s->gpo = val & 0xff; break;
     default:       break;
     }
@@ -539,6 +586,7 @@ static void xlnx_iic_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq);
     s->bus = i2c_init_bus(dev, "i2c");
+    s->bh = qemu_bh_new(xlnx_iic_irq_bh, s);
 }
 
 static const VMStateDescription vmstate_xlnx_iic = {
