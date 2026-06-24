@@ -341,8 +341,15 @@ static void xlnx_iic_write_cr(XlnxXpsIicState *s, uint8_t cr)
     /* Repeated start (RSTA) while master: hold the bus for a chained transfer.
      * If the new address was already staged into the TX FIFO, reopen now;
      * otherwise arm so the next DTR address byte reopens the transfer (the
-     * order XIic_MasterRecv uses: write CR|RSTA, then RFD, then the address). */
-    if ((cr & CR_RSTA) && s->active) {
+     * order XIic_MasterRecv uses: write CR|RSTA, then RFD, then the address).
+     *
+     * RSTA is only meaningful while MSMS is set: on real silicon a repeated
+     * START is issued in place of a STOP only when the master stays on the bus.
+     * The driver's RecvMasterData completion path clears MSMS while RSTA is
+     * still set (CR=0x31) to end the transfer with a STOP; without the MSMS
+     * guard we'd mistake that for another repeated start, never end the i2c
+     * transfer, and spuriously refill the Rx FIFO on the final DRR read. */
+    if ((cr & CR_RSTA) && (cr & CR_MSMS) && s->active) {
         if (s->tx_count > 0) {
             i2c_end_transfer(s->bus);
             s->active = false;
