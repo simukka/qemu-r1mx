@@ -69,7 +69,23 @@
 #define R_PWB  10   /* +0x28 pkt wait bound       */
 #define R_IS   11   /* +0x2C interrupt status     */
 #define R_IE   12   /* +0x30 interrupt enable     */
-#define R_MAX  13
+#define R_MAX  13   /* number of *active* XPS-Central-DMA registers (offsets 0x00-0x30) */
+
+/*
+ * The device decodes the full 0x10000 PLB slot, not just the 13 Central-DMA
+ * registers.  The RED ONE MX IOFPGA packs a separate frame-buffer DMA engine
+ * into the same window: its register banks live at +0x4000 (channel A) and
+ * +0x8000 (channel B) — e.g. the FrameBufferBlit path drives base 0x64014408
+ * with pending/ack at +0x04, control+status at +0x08 and DMACTRL at +0x28
+ * (see re_reference / qemu_frmbuf_dma.md).  Those reads/writes previously hit
+ * the "out of range" branch (reads → 0, writes dropped), which made the
+ * firmware's "FrmBuf: DMA timeout, STAT=0 DMACTRL=0" diagnostic print zeros.
+ * Back the whole window so decoded-but-not-yet-modelled registers read back
+ * what was written, matching a real IPIF peripheral.  The 13 active registers
+ * keep their special behaviour via the switch() below; everything else is
+ * plain storage until the frame-buffer DMA is given a proper IRQ-driven model.
+ */
+#define R_WINDOW (0x10000 >> 2)   /* 64 KB slot / 4 = 16384 word registers */
 
 /* -------------------------------------------------------------------------
  * Bit fields
@@ -130,7 +146,7 @@ struct XilinxOPBDMA {
     SysBusDevice   parent_obj;
     MemoryRegion   mmio;
     qemu_irq       irq;
-    uint32_t       regs[R_MAX];
+    uint32_t       regs[R_WINDOW];
     /* Activity monitoring — set by xlnx_opb_dma_set_activity() */
     R1mxActivityCb activity_cb;    /* NULL = disabled */
     void          *activity_opaque;
@@ -337,13 +353,15 @@ static uint64_t opb_dma_read(void *opaque, hwaddr offset, unsigned size)
     unsigned      idx = offset >> 2;
     uint64_t      val;
 
-    if (idx >= R_MAX) {
+    if (idx >= R_WINDOW) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "xlnx.opb-dma: read at 0x%"HWADDR_PRIx" out of range\n",
                       offset);
         return 0;
     }
 
+    /* idx >= R_MAX: frame-buffer DMA / other IOFPGA register banks — plain
+     * read-back storage (see the R_WINDOW note above). */
     val = s->regs[idx];
     if (s->activity_cb) {
         s->activity_cb(s->dev_id, R1MX_DIR_READ,
@@ -360,7 +378,7 @@ static void opb_dma_write(void *opaque, hwaddr offset,
     unsigned      idx = offset >> 2;
     uint32_t      v   = (uint32_t)val;
 
-    if (idx >= R_MAX) {
+    if (idx >= R_WINDOW) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "xlnx.opb-dma: write 0x%08x at 0x%"HWADDR_PRIx
                       " out of range\n", v, offset);
@@ -442,7 +460,17 @@ static const MemoryRegionOps opb_dma_ops = {
     .write      = opb_dma_write,
     .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
-        .min_access_size = 4,
+        /*
+         * The Xilinx IPIF decodes byte/halfword as well as word accesses on the
+         * PLB, and the RED frame-buffer DMA driver does issue 16-bit register
+         * accesses (lhbrx/sthbrx) to this slot.  Rejecting them (min 4) made
+         * QEMU log "Invalid write ... invalid size (min:4 max:4)" and drop the
+         * access entirely.  Accept 1/2/4-byte accesses; impl stays at 4 so the
+         * memory core assembles sub-word accesses into our 32-bit reg ops
+         * (read-modify-write for writes), which the active Central-DMA
+         * registers are never touched by sub-word, so no transfer mis-fires.
+         */
+        .min_access_size = 1,
         .max_access_size = 4,
     },
     .impl = {
