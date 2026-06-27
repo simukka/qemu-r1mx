@@ -574,10 +574,22 @@ static void install_spy_mr(MemoryRegion *sysmem, MemoryRegion *real_mr,
  * --------------------------------------------------------------------------- */
 static uint64_t fpga_catchall_read(void *opaque, hwaddr offset, unsigned size)
 {
+    uint32_t addr = (uint32_t)(0xe0000000u + offset);
+    uint64_t val  = 0;
     (void)opaque;
+
+    /* IOFPGA (0xe2000000) minimal status modelling for the video pipeline.
+     * 0xe200028c: VPFPGA config status — bit8 (0x100) = DONE.  The firmware's
+     * config-done poll (fn @0x352ce4) spins 65535× on this bit and otherwise
+     * reports "VPFPGA failed to load (DONE signal was not detected)".  Report
+     * DONE so the VP-FPGA configures and the video front-end can come up. */
+    if (addr == 0xe200028cu) {
+        val = 0x00000100u;
+    }
+
     activity_broker_send(&g_activity_broker, R1MX_DEV_FPGA, R1MX_DIR_READ,
-                          (uint32_t)(0xe0000000u + offset), 0, size);
-    return 0;
+                          addr, val, size);
+    return val;
 }
 
 static void fpga_catchall_write(void *opaque, hwaddr offset,
