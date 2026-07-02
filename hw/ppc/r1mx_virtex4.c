@@ -587,6 +587,18 @@ static uint64_t fpga_catchall_read(void *opaque, hwaddr offset, unsigned size)
         val = 0x00000100u;
     }
 
+    /* 0xe20000f8: RocketIO/MGT channel status.  VpConfigVerifyRio (fn @0x234c14,
+     * "VpConfigVerifyRio:197 Rocket IO Channel is not up!") reads this via the
+     * generic register accessor (@0x45e510, reg 0xa104 -> 0xe20000f8) and tests
+     * bit0 (andi. r0,r3,1): set = "channel up".  Without it VpConfigDoProgram
+     * loops "Retrying config..." forever ("Reboot Detected VPFPGA forced to
+     * restart...").  Report the link up so VP-FPGA configuration succeeds; the
+     * VPFPGA comm-FIFO model (0xe0080000 +0x18 bit10) keeps the subsequent
+     * driver init from hanging, which is why this can now be modelled safely. */
+    if (addr == 0xe20000f8u) {
+        val = 0x00000001u;
+    }
+
     activity_broker_send(&g_activity_broker, R1MX_DEV_FPGA, R1MX_DIR_READ,
                           addr, val, size);
     return val;
