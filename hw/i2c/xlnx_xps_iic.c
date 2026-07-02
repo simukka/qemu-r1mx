@@ -36,7 +36,6 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
-#include "qemu/main-loop.h"
 #include "hw/sysbus.h"
 #include "hw/irq.h"
 #include "hw/i2c/i2c.h"
@@ -150,12 +149,21 @@ struct XlnxXpsIicState {
      * shift onto the wire (TX_EMPTY asserts after the drain), and an Rx byte
      * takes time to clock in (RX_FULL asserts after it arrives).  The
      * interrupt-driven driver feeds/drains the FIFO one byte per ISR and then
-     * acknowledges the edge that woke it (XIic_mClearIisr); if we asserted the
-     * NEXT edge *synchronously* inside that same ISR's DTR/DRR access, the
-     * acknowledge would swallow it and the multi-byte transfer would stall and
-     * time out (~1 s).  So defer TX_EMPTY/RX_FULL to a bottom-half that runs
-     * after the guest's ISR returns, modelling the FIFO shift latency. */
-    QEMUBH  *bh;
+     * acknowledges the edge that woke it: XIic_InterruptHandler ends with an
+     * unconditional write-1-to-clear of IISR — and on the TX path it even
+     * re-reads IISR after the handler and clears any TX_EMPTY it sees.  If the
+     * NEXT edge became visible anywhere inside that window (synchronously in
+     * the DTR/DRR access, or from a bottom-half racing the vCPU), the ack
+     * swallows it and the transfer stalls into the driver's 1 s timeout.
+     *
+     * On hardware the next edge arrives one I2C byte-time (~25-90 us) after
+     * the access — always after the ISR's ack.  Model that ordering exactly:
+     * while an interrupt is being serviced (enabled IISR bit pending with
+     * DGIER on), hold the new edge in deferred_iisr and release it only when
+     * the guest writes IISR — the ack that ends every service pass (the
+     * driver's polled paths also ack after every byte via XIic_mClearIisr).
+     * Outside interrupt service (setup runs in a DGIER-off critical region,
+     * polled paths run with interrupts masked) assert the edge immediately. */
     uint32_t deferred_iisr;
 };
 
@@ -167,26 +175,34 @@ static void xlnx_iic_update_irq(XlnxXpsIicState *s)
     qemu_set_irq(s->irq, level);
 }
 
-/* Bottom-half: a TX-drain / Rx-fill edge has "completed" on the wire — assert
- * the deferred IISR bit(s) now, after the guest's current ISR/MMIO returned. */
-static void xlnx_iic_irq_bh(void *opaque)
+/* Is the guest inside an interrupt-service pass for this controller?  True
+ * while an enabled IISR bit is pending with global interrupts on (the bit that
+ * vectored the ISR stays latched until its exit ack), or while an edge is
+ * already being held.  Callers whose own register access clears the latched
+ * bit (a DRR read pops RX_FULL) must sample this *before* that access. */
+static bool xlnx_iic_in_service(XlnxXpsIicState *s)
 {
-    XlnxXpsIicState *s = opaque;
-
-    s->iisr |= s->deferred_iisr;
-    s->deferred_iisr = 0;
-    xlnx_iic_update_irq(s);
+    return s->deferred_iisr ||
+        ((s->dgier & DGIER_GIE) && (s->iisr & s->iier));
 }
 
-/* Defer asserting an IISR edge (TX_EMPTY/RX_FULL): clear it now (the FIFO
- * momentarily holds/lacks the byte) and schedule the BH to re-assert it after
- * the guest ISR that is feeding/draining the FIFO returns — so the ISR's own
- * XIic_mClearIisr cannot swallow the next byte's completion edge. */
-static void xlnx_iic_defer_int(XlnxXpsIicState *s, uint32_t bit)
+/* Assert an IISR completion edge (TX_EMPTY/RX_FULL) for a byte that on real
+ * silicon would only finish clocking one I2C byte-time later.  Mid-ISR
+ * (in_service), clear the bit and hold the edge in deferred_iisr; it is
+ * released by the guest's IISR write-1-to-clear ack, so the ack can never
+ * swallow it.  Otherwise no service pass is in flight (driver setup runs in a
+ * DGIER-off critical region, polled paths with interrupts masked) and the
+ * edge asserts immediately. */
+static void xlnx_iic_defer_int(XlnxXpsIicState *s, uint32_t bit,
+                               bool in_service)
 {
-    s->iisr &= ~bit;
-    s->deferred_iisr |= bit;
-    qemu_bh_schedule(s->bh);
+    if (in_service) {
+        s->iisr &= ~bit;
+        s->deferred_iisr |= bit;
+    } else {
+        s->iisr |= bit;
+    }
+    xlnx_iic_update_irq(s);
 }
 
 static uint8_t xlnx_iic_status(XlnxXpsIicState *s)
@@ -220,7 +236,7 @@ static void xlnx_iic_prefetch(XlnxXpsIicState *s)
  * The driver's ISR (RecvMasterData) reads RFO for the count and drains DRR;
  * each DRR read pops a byte and triggers a refill, so the bus is effectively
  * throttled at the FIFO threshold exactly as the hardware does. */
-static void xlnx_iic_rx_refill(XlnxXpsIicState *s)
+static void xlnx_iic_rx_refill(XlnxXpsIicState *s, bool in_service)
 {
     int target = (int)s->rfd + 1;       /* RFD is a zero-based threshold */
 
@@ -231,9 +247,9 @@ static void xlnx_iic_rx_refill(XlnxXpsIicState *s)
         s->rx_fifo[s->rx_count++] = s->nak ? 0xff : i2c_recv(s->bus);
     }
     if (s->rx_count > 0) {
-        /* Defer RX_FULL: the byte clocks in after the ISR that drained the
-         * previous one returns, so its acknowledge can't swallow this edge. */
-        xlnx_iic_defer_int(s, INT_RX_FULL);
+        /* RX_FULL for the refilled byte: mid-ISR it is held until the exit
+         * acknowledge so that ack can't swallow this edge. */
+        xlnx_iic_defer_int(s, INT_RX_FULL, in_service);
     } else {
         xlnx_iic_update_irq(s);
     }
@@ -251,6 +267,7 @@ static void xlnx_iic_stop(XlnxXpsIicState *s)
     s->stop_pending = false;
     s->tx_count = 0;            /* drop any stale staged bytes */
     s->dyn_rx_remaining = 0;
+    s->deferred_iisr = 0;       /* a held edge can't outlive its transfer */
     /* leave have_rx intact: a byte prefetched just before STOP is still read */
     s->iisr |= INT_BNB;
     xlnx_iic_update_irq(s);
@@ -288,7 +305,7 @@ static void xlnx_iic_begin(XlnxXpsIicState *s, uint8_t addr_byte, bool dynamic)
             /* Standard-mode master receive: start a fresh Rx FIFO and clock in
              * bytes up to the RFD threshold, raising RX_FULL for the ISR. */
             s->rx_count = 0;
-            xlnx_iic_rx_refill(s);
+            xlnx_iic_rx_refill(s, xlnx_iic_in_service(s));
         }
     } else {
         s->iisr |= INT_TX_EMPTY;
@@ -444,8 +461,7 @@ static void xlnx_iic_write_dtr(XlnxXpsIicState *s, uint64_t val, unsigned size)
             if (i2c_send(s->bus, byte)) {
                 s->iisr |= INT_TX_ERROR;
             }
-            xlnx_iic_defer_int(s, INT_TX_EMPTY);
-            xlnx_iic_update_irq(s);
+            xlnx_iic_defer_int(s, INT_TX_EMPTY, xlnx_iic_in_service(s));
         }
     }
 }
@@ -475,29 +491,34 @@ static uint8_t xlnx_iic_read_drr(XlnxXpsIicState *s)
     /* Standard-mode receive: pop the next byte from the Rx FIFO.  A transfer
      * may already have been stopped (the ISR clears MSMS before the final DRR
      * reads), so a buffered byte stays readable; only refill while still
-     * active so the bus throttles at the RFD threshold. */
-    if (s->rx_count > 0) {
-        v = s->rx_fifo[0];
-        s->rx_count--;
-        memmove(s->rx_fifo, s->rx_fifo + 1, s->rx_count);
-    } else {
-        v = 0xff;
+     * active so the bus throttles at the RFD threshold.
+     *
+     * Sample in-service *before* clearing RX_FULL below: that latched bit is
+     * usually the very interrupt being serviced, and it is the evidence that
+     * the refilled byte's edge must be held until the ISR's exit ack. */
+    {
+        bool in_service = xlnx_iic_in_service(s);
+
+        if (s->rx_count > 0) {
+            v = s->rx_fifo[0];
+            s->rx_count--;
+            memmove(s->rx_fifo, s->rx_fifo + 1, s->rx_count);
+        } else {
+            v = 0xff;
+        }
+        s->iisr &= ~INT_RX_FULL;
+        if (s->active && s->dir_read) {
+            xlnx_iic_rx_refill(s, in_service);
+        }
+        xlnx_iic_update_irq(s);
+        return v;
     }
-    s->iisr &= ~INT_RX_FULL;
-    if (s->active && s->dir_read) {
-        xlnx_iic_rx_refill(s);
-    }
-    xlnx_iic_update_irq(s);
-    return v;
 }
 
 static void xlnx_iic_reset_state(XlnxXpsIicState *s)
 {
     if (s->active) {
         i2c_end_transfer(s->bus);
-    }
-    if (s->bh) {
-        qemu_bh_cancel(s->bh);
     }
     s->deferred_iisr = 0;
     s->cr = s->adr = s->rfd = s->gpo = 0;
@@ -559,7 +580,17 @@ static void xlnx_iic_write(void *opaque, hwaddr offset, uint64_t val,
         }
         break;
     case R_DGIER:  s->dgier = val; xlnx_iic_update_irq(s); break;
-    case R_IISR:   s->iisr &= ~(uint32_t)val; xlnx_iic_update_irq(s); break;
+    case R_IISR:
+        /* Write-1-to-clear ack.  This is the end of the guest's service pass
+         * (the ISR's final XIIC_WRITE_IISR, or a polled path's per-byte
+         * XIic_mClearIisr), so release any held completion edge *after*
+         * applying the clear — the next byte's edge arrives "on the wire"
+         * only once the previous one has been acknowledged. */
+        s->iisr &= ~(uint32_t)val;
+        s->iisr |= s->deferred_iisr;
+        s->deferred_iisr = 0;
+        xlnx_iic_update_irq(s);
+        break;
     case R_IIER:   s->iier = val; xlnx_iic_update_irq(s); break;
     case R_CR:     xlnx_iic_write_cr(s, val & 0xff); break;
     case R_DTR:    xlnx_iic_write_dtr(s, val, size); break;
@@ -593,13 +624,12 @@ static void xlnx_iic_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq);
     s->bus = i2c_init_bus(dev, "i2c");
-    s->bh = qemu_bh_new(xlnx_iic_irq_bh, s);
 }
 
 static const VMStateDescription vmstate_xlnx_iic = {
     .name = TYPE_XLNX_XPS_IIC,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8(cr, XlnxXpsIicState),
         VMSTATE_UINT8(adr, XlnxXpsIicState),
@@ -621,6 +651,7 @@ static const VMStateDescription vmstate_xlnx_iic = {
         VMSTATE_UINT8_ARRAY(rx_fifo, XlnxXpsIicState, 16),
         VMSTATE_BOOL(rsta_armed, XlnxXpsIicState),
         VMSTATE_BOOL(stop_pending, XlnxXpsIicState),
+        VMSTATE_UINT32(deferred_iisr, XlnxXpsIicState),
         VMSTATE_END_OF_LIST()
     }
 };
