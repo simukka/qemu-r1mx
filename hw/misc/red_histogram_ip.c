@@ -44,7 +44,7 @@ struct RedHistogramIPState {
     /* Activity monitoring — set by r1mx_init() via red_histogram_ip_set_activity() */
     R1mxActivityCb activity_cb;    /* NULL = disabled */
     void          *activity_opaque;
-    uint8_t        dev_id;         /* R1MX_DEV_HIST_* */
+    uint8_t        dev_id;         /* R1MX_DEV_VPFPGA/SDIO/AUDIO/IODMA/FRMBUF */
     uint32_t       base_addr;      /* guest physical base, filled at realize  */
 };
 

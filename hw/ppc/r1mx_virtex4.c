@@ -1075,25 +1075,25 @@ static void r1mx_init(MachineState *machine)
      * the "histogram enabled" paths and continue boot cleanly.
      * IRQ lines are never asserted (no sensor data in emulation).
      *
-     * Names / PLB addresses (from firmware device strings + xparameters.h):
-     *   "Luma Histogram"  0xe0080000   "RGB Histogram"    0xe00a0000
-     *   "RGB Comp Histo"  0xe0100000   "Mono Histogram"   0xe0120000
-     *   "Luma Waveform"   0xe0200000
+     * These five red.histogram-ip instances are MISNAMED: the firmware
+     * device table (software.bin @0xe0be10) identifies the blocks as
+     *   0xe0080000 vpfpga   0xe00a0000 sdio   0xe0100000 audio
+     *   0xe0120000 dma      0xe0200000 frmBuf
      * Size: 0x20000 each (128 KB) to cover all observed access offsets. */
     {
         static const hwaddr hist_bases[] = {
-            HIST1_BASE,   /* Luma Histogram  0xe0080000 */
-            HIST0_BASE,   /* RGB Histogram   0xe00a0000 */
-            HIST2_BASE,   /* RGB Comp Histo  0xe0100000 */
-            HIST3_BASE,   /* Mono Histogram  0xe0120000 */
-            HIST4_BASE,   /* Luma Waveform   0xe0200000 */
+            HIST1_BASE,   /* vpfpga comm FIFO 0xe0080000 */
+            HIST0_BASE,   /* sdio             0xe00a0000 */
+            HIST2_BASE,   /* audio            0xe0100000 */
+            HIST3_BASE,   /* iofpga dma       0xe0120000 */
+            HIST4_BASE,   /* frame buffer     0xe0200000 */
         };
         static const uint8_t hist_dev_ids[] = {
-            R1MX_DEV_HIST_LUMA,
-            R1MX_DEV_HIST_RGB,
-            R1MX_DEV_HIST_RGBC,
-            R1MX_DEV_HIST_MONO,
-            R1MX_DEV_HIST_WAVE,
+            R1MX_DEV_VPFPGA,
+            R1MX_DEV_SDIO,
+            R1MX_DEV_AUDIO,
+            R1MX_DEV_IODMA,
+            R1MX_DEV_FRMBUF,
         };
         for (i = 0; i < (int)ARRAY_SIZE(hist_bases); i++) {
             DeviceState  *hd = qdev_new("red.histogram-ip");

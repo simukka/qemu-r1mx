@@ -26,11 +26,11 @@
 #define R1MX_DEV_UART        0   /* XPS UARTLite       0xe0600000 */
 #define R1MX_DEV_ETHERNET    1   /* XPS EthernetLite   0xe1020000 */
 #define R1MX_DEV_DMA         2   /* OPB DMA Channel    0x64010000 */
-#define R1MX_DEV_HIST_LUMA   3   /* Luma Histogram     0xe0080000 */
-#define R1MX_DEV_HIST_RGB    4   /* RGB Histogram      0xe00a0000 */
-#define R1MX_DEV_HIST_RGBC   5   /* RGB Comp Histo     0xe0100000 */
-#define R1MX_DEV_HIST_MONO   6   /* Mono Histogram     0xe0120000 */
-#define R1MX_DEV_HIST_WAVE   7   /* Luma Waveform      0xe0200000 */
+#define R1MX_DEV_VPFPGA      3   /* VP-FPGA comm FIFO  0xe0080000 (was Luma Histogram) */
+#define R1MX_DEV_SDIO        4   /* SD / SDIO block    0xe00a0000 (was RGB Histogram)  */
+#define R1MX_DEV_AUDIO       5   /* Audio block        0xe0100000 (was RGB Comp Histo) */
+#define R1MX_DEV_IODMA       6   /* IOFPGA DMA block   0xe0120000 (was Mono Histogram) */
+#define R1MX_DEV_FRMBUF      7   /* Frame buffer       0xe0200000 (was Luma Waveform)  */
 #define R1MX_DEV_FPGA        8   /* FPGA catch-all     0xe0000000 */
 #define R1MX_DEV_CPU         9   /* PPC405F6 CPU sampler           */
 #define R1MX_DEV_RAM        10   /* System RAM         0x00000000 */
