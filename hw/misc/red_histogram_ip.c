@@ -52,7 +52,35 @@ static uint64_t red_hist_read(void *opaque, hwaddr offset, unsigned size)
 {
     RedHistogramIPState *s = opaque;
     uint64_t val = 0;
-    /* All reads return 0 (see file header for rationale). */
+
+    /*
+     * The 0xe0080000 instance is not a histogram core.  The firmware's device
+     * table (software.bin @0xe0be10) maps 0xe0080000 as the "vpfpga" block —
+     * the VP-FPGA command/response FIFO.  (The five "histogram" labels here are
+     * all misattributed: 0xe0080000=vpfpga, 0xe00a0000=sdio, 0xe0100000=audio,
+     * 0xe0120000=dma, 0xe0200000=frmBuf.)
+     *
+     * The VPFPGA driver-init routine (fn @0x374ba4, reached from the
+     * "Initializing VPFPGA driver..." message) drains this FIFO and then spins
+     * at 0x374c30-0x374c4c reading +0x10/+0x14/+0x18 every iteration, looping
+     * until bit10 (0x400) of the +0x18 status word is set:
+     *
+     *     lwz  r3,0x10(r31); bl read32   ; drain data word 0
+     *     lwz  r3,0x14(r31); bl read32   ; drain data word 1
+     *     lwz  r3,0x18(r31); bl read32   ; status
+     *     andi. r0,r3,0x400              ; bit10 = FIFO drained / ready
+     *     beq  0x374c30                  ; spin while clear
+     *
+     * With the region returning 0 the bit never sets and driver init hangs —
+     * this is the boot wall after "Initializing VPFPGA driver...".  Report the
+     * FIFO as ready (drained/empty) so the loop exits on its first pass and the
+     * device registers.  The drained data words (+0x10/+0x14) are discarded by
+     * the firmware, so returning 0 for them is correct.
+     */
+    if (s->base_addr == 0xe0080000u && offset == 0x18) {
+        val = 0x00000400u;
+    }
+
     if (s->activity_cb) {
         s->activity_cb(s->dev_id, R1MX_DIR_READ,
                         s->base_addr + (uint32_t)offset, val, size,
